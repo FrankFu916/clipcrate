@@ -64,7 +64,17 @@ clipcrate clear --last     # oops
 | Delete             | remove entry                    |
 
 `pick` prints without a trailing newline, so `cd "$(clipcrate pick)"` just
-works.
+works. `pick --copy` puts the selection on the clipboard instead — pair it
+with a hotkey daemon for a system-wide history:
+
+```bash
+# skhd (macOS): Cmd+Shift+V opens the picker and copies the choice
+cmd + shift - v : /opt/homebrew/bin/clipcrate pick --copy
+
+# sxhkd (Linux): super + v does the same
+super + v
+    clipcrate pick --copy
+```
 
 ### Images
 
@@ -75,7 +85,7 @@ the history file. `pick` copies the image back to the clipboard;
 ## CLI
 
 ```
-clipcrate pick [--newline]
+clipcrate pick [--newline] [--copy]
 clipcrate list [--limit N] [--json]
 clipcrate get <id|- >
 clipcrate copy <id>

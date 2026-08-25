@@ -46,6 +46,10 @@ enum Cmd {
         /// Append a trailing newline to the printed selection.
         #[arg(long)]
         newline: bool,
+        /// Put the selection on the system clipboard instead of printing
+        /// (images always go to the clipboard). Silent on success.
+        #[arg(long)]
+        copy: bool,
     },
     /// List history (newest first).
     List {
@@ -139,7 +143,7 @@ fn load_config() -> Result<Config> {
 
 fn dispatch(cmd: Cmd) -> Result<()> {
     match cmd {
-        Cmd::Pick { newline } => {
+        Cmd::Pick { newline, copy } => {
             let mut s = open_store()?;
             if s.is_empty() {
                 bail!("history is empty — copy something while `clipcrate watch` runs");
@@ -152,6 +156,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                         put_image_on_clipboard(&png)?;
                         println!("copied image #{id} back to the clipboard");
                     }
+                    Kind::Text if copy => put_text_on_clipboard(&e.text)?,
                     Kind::Text => {
                         let mut out = std::io::stdout().lock();
                         out.write_all(e.text.as_bytes())?;

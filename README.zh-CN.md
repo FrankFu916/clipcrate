@@ -63,7 +63,17 @@ clipcrate clear --last     # 手滑了
 | Ctrl+P            | 置顶/取消置顶（置顶不过期） |
 | Delete            | 删除条目                    |
 
-`pick` 输出不带换行符，因此 `cd "$(clipcrate pick)"` 可以直接用。
+`pick` 输出不带换行符，因此 `cd "$(clipcrate pick)"` 可以直接用。`--copy`
+会把选中内容放回系统剪贴板而不是打印——配合热键守护进程就是全局历史：
+
+```bash
+# skhd（macOS）：Cmd+Shift+V 打开选择器并复制选中项
+cmd + shift - v : /opt/homebrew/bin/clipcrate pick --copy
+
+# sxhkd（Linux）：super + v 同理
+super + v
+    clipcrate pick --copy
+```
 
 ### 图片
 

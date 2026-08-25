@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1] - 2026-08-26
+
+### Added
+- `pick --copy`: put the selection on the system clipboard instead of printing,
+  enabling one-hotkey workflows via skhd/Hammerspoon/sxhkd/AutoHotkey.
+
+### Changed
+- Watcher idle cost reduced to a single pasteboard read per poll: the store is
+  no longer opened every tick, and copied screenshots are no longer re-encoded
+  on every poll until the clipboard changes again.
+
 ## [0.1.0] - 2026-08-25
 
 ### Added

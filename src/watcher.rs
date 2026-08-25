@@ -86,34 +86,60 @@ impl<C: Clipboard> Watcher<C> {
         Ok(Tick::Recorded)
     }
 
-    /// Run until `stop` is set. Sleeps between polls; each tick opens the
-    /// store briefly so CLI commands can interleave between ticks.
+    /// Run until `stop` is set. The clipboard probe is cheap; the store is
+    /// only opened (and PNGs only re-encoded) when content actually changed,
+    /// so an idle watcher costs one pasteboard read per poll.
     pub fn run(mut self, stop: Arc<AtomicBool>) -> Result<()> {
         let mut last_text = String::new();
+        let mut last_image = String::new();
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            let mut store = match Store::open(&self.store_dir) {
-                Ok(s) => s,
-                Err(_) => {
-                    // Lock held by a CLI command right now: skip this tick.
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-            };
-            let text = self.clip.get_text().unwrap_or_default();
-            if text != last_text && !text.is_empty() {
-                let before = store.len();
-                let _ = self.tick(&mut store);
-                if store.len() != before || self.dedup != DedupMode::All {
+            match self.next_action(&last_text, &last_image) {
+                Some(Action::Text(text)) => {
+                    if let Ok(mut store) = Store::open(&self.store_dir) {
+                        let _ = self.tick(&mut store);
+                    }
                     last_text = text;
                 }
+                Some(Action::Image(png)) => {
+                    last_image = blake3_hex(&png);
+                    if let Ok(mut store) = Store::open(&self.store_dir) {
+                        let _ = self.tick(&mut store);
+                    }
+                }
+                None => {}
             }
-            drop(store);
             std::thread::sleep(self.poll);
         }
     }
+
+    /// Probe the clipboard and decide whether anything changed enough to
+    /// justify opening the store. `None` = idle.
+    fn next_action(&mut self, last_text: &str, last_image: &str) -> Option<Action> {
+        let text = self.clip.get_text().unwrap_or_default();
+        if !text.is_empty() {
+            if text == last_text {
+                return None;
+            }
+            return Some(Action::Text(text));
+        }
+        // Empty text: the clipboard may hold an image instead.
+        let png = self.clip.get_image_png().ok().flatten()?;
+        let digest = blake3_hex(&png);
+        if digest == last_image {
+            return None;
+        }
+        Some(Action::Image(png))
+    }
+}
+
+/// What the clipboard probe found on its most recent poll.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    Text(String),
+    Image(Vec<u8>),
 }
 
 /// FNV-1a hex digest — enough to dedupe image payloads locally without
@@ -256,5 +282,51 @@ mod tests {
         let b = blake3_hex(b"same bytes");
         assert_eq!(a, b);
         assert_ne!(a, blake3_hex(b"other bytes"));
+    }
+
+    #[test]
+    fn next_action_gates_unchanged_content() {
+        let dir = tmpdir("gate");
+        let clip = shared("");
+        let mut w = w(clip.clone(), &dir);
+
+        // Unchanged text → idle.
+        clip.lock().unwrap().set_text("stable").unwrap();
+        assert_eq!(w.next_action("", ""), Some(Action::Text("stable".into())));
+        assert_eq!(
+            w.next_action("stable", ""),
+            None,
+            "same text must not reopen the store"
+        );
+
+        // Changed text fires again.
+        clip.lock().unwrap().set_text("moved on").unwrap();
+        assert_eq!(
+            w.next_action("stable", ""),
+            Some(Action::Text("moved on".into()))
+        );
+
+        // Image content is gated by digest.
+        let png = tiny_png(7);
+        clip.lock().unwrap().set_text("").unwrap();
+        clip.lock().unwrap().png = Some(png.clone());
+        match w.next_action("moved on", "") {
+            Some(Action::Image(p)) => assert_eq!(p, png),
+            other => panic!("expected image action, got {other:?}"),
+        }
+        assert_eq!(
+            w.next_action("moved on", &blake3_hex(&png)),
+            None,
+            "same image digest must be idle"
+        );
+    }
+
+    fn tiny_png(seed: u8) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([seed, seed, seed, 255]));
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
     }
 }
