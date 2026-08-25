@@ -28,7 +28,7 @@ $ clipcrate get - | pbcopy
 ## 安装
 
 ```bash
-# 从源码（Rust 1.85+）
+# 从源码（Rust 1.88+）
 cargo install --git https://github.com/FrankFu916/clipcrate
 
 # 或从 Releases 下载预编译二进制放进 PATH

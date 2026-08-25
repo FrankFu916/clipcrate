@@ -28,7 +28,7 @@ switching to the mouse for one keystroke of value. `clipcrate` is built
 ## Install
 
 ```bash
-# from source (Rust 1.85+)
+# from source (Rust 1.88+)
 cargo install --git https://github.com/FrankFu916/clipcrate
 
 # or grab a prebuilt binary from Releases and put it on your PATH
