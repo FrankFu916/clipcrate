@@ -32,6 +32,9 @@ $ clipcrate get - | pbcopy
 ## 安装
 
 ```bash
+# macOS / Linux 用 Homebrew
+brew install frankfu916/tap/clipcrate
+
 # 从 crates.io（Rust 1.88+）
 cargo install clipcrate
 

@@ -32,7 +32,10 @@ switching to the mouse for one keystroke of value. `clipcrate` is built
 ## Install
 
 ```bash
-# from crates.io (Rust 1.88+)
+# macOS / Linux via Homebrew
+brew install frankfu916/tap/clipcrate
+
+# or from crates.io (Rust 1.88+)
 cargo install clipcrate
 
 # or from source
