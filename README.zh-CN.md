@@ -1,5 +1,9 @@
 # clipcrate
 
+[![CI](https://github.com/FrankFu916/clipcrate/actions/workflows/ci.yml/badge.svg)](https://github.com/FrankFu916/clipcrate/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/clipcrate.svg)](https://crates.io/crates/clipcrate)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **终端优先的剪贴板历史管理器。** 一个极小的后台守护进程记录你复制的所有内容；
 模糊搜索选择器一键取回 —— 100% 本地存储，没有你不掌控的进程，无云端、无账号。
 
@@ -28,7 +32,10 @@ $ clipcrate get - | pbcopy
 ## 安装
 
 ```bash
-# 从源码（Rust 1.88+）
+# 从 crates.io（Rust 1.88+）
+cargo install clipcrate
+
+# 或从源码
 cargo install --git https://github.com/FrankFu916/clipcrate
 
 # 或从 Releases 下载预编译二进制放进 PATH

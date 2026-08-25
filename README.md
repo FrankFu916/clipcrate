@@ -1,5 +1,9 @@
 # clipcrate
 
+[![CI](https://github.com/FrankFu916/clipcrate/actions/workflows/ci.yml/badge.svg)](https://github.com/FrankFu916/clipcrate/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/clipcrate.svg)](https://crates.io/crates/clipcrate)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Terminal-first clipboard history manager.** A tiny background watcher records
 everything you copy; a fuzzy-search picker pastes it back — 100% local, no
 daemon you don't control, no cloud, no account.
@@ -28,7 +32,10 @@ switching to the mouse for one keystroke of value. `clipcrate` is built
 ## Install
 
 ```bash
-# from source (Rust 1.88+)
+# from crates.io (Rust 1.88+)
+cargo install clipcrate
+
+# or from source
 cargo install --git https://github.com/FrankFu916/clipcrate
 
 # or grab a prebuilt binary from Releases and put it on your PATH
