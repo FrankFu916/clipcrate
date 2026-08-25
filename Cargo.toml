@@ -1,0 +1,34 @@
+[package]
+name = "clipcrate"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal-first clipboard history manager: background watcher, fuzzy-search TUI picker, 100% local storage"
+license = "MIT"
+repository = "https://github.com/FrankFu916/clipcrate"
+homepage = "https://github.com/FrankFu916/clipcrate"
+readme = "README.md"
+keywords = ["cli", "clipboard", "tui", "terminal", "productivity"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+arboard = "3"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+crossterm = "0.28"
+directories = "5"
+fs2 = "0.4"
+fuzzy-matcher = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+ratatui = "0.29"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
