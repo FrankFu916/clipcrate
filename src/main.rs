@@ -331,9 +331,12 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             let mut next_id = s.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
             let mut added = 0usize;
             let mut skipped = 0usize;
-            for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+            for (line_no, line) in raw.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
                 let e: entry::Entry = serde_json::from_str(line)
-                    .with_context(|| format!("bad import line: {line}"))?;
+                    .with_context(|| format!("bad import line {}", line_no + 1))?;
                 if s.entries
                     .iter()
                     .any(|x| x.kind == e.kind && x.text == e.text)
@@ -389,7 +392,11 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                 let mut cfg = load_config()?;
                 apply_set(&mut cfg, &key, &value)?;
                 cfg.save(&Config::default_path())?;
-                println!("{key} = {value}");
+                if key == "max_entries" {
+                    let mut store = open_store()?;
+                    store.enforce_limits()?;
+                }
+                println!("{key} updated");
                 Ok(())
             }
             ConfigAction::DenyAdd { pattern } => {
