@@ -276,22 +276,25 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             let s = open_store()?;
             match out {
                 Some(p) => {
-                    let mut buf = Vec::new();
-                    for e in &s.entries {
-                        serde_json::to_writer(&mut buf, e)?;
-                        buf.extend_from_slice(b"\n");
+                    let history_path = s.data_dir().join(store::HISTORY_FILE);
+                    let config_path = Config::default_path();
+                    if same_existing_file(&p, &history_path)
+                        || same_existing_file(&p, &config_path)
+                    {
+                        bail!("refusing to overwrite clipcrate's internal data file");
                     }
-                    std::fs::write(&p, &buf)?;
-                    println!(
-                        "exported {} entries (+ images/ if present) → {}",
-                        s.len(),
-                        p.display()
-                    );
+
                     let export_root = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+                    // Validate and copy every referenced image before publishing
+                    // the JSONL manifest, so a failed image export cannot leave
+                    // behind an apparently complete backup manifest.
                     for e in s.entries.iter().filter(|e| e.kind == Kind::Image) {
                         let src = e
                             .payload_path(s.data_dir())
                             .context("unsafe image path in history")?;
+                        if !src.is_file() {
+                            bail!("missing image payload {}", src.display());
+                        }
                         let file_name =
                             src.file_name().context("image payload has no file name")?;
                         let dst = export_root.join("images").join(file_name);
@@ -299,7 +302,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                             std::fs::create_dir_all(parent)?;
                         }
                         let same_file = if dst.exists() {
-                            std::fs::canonicalize(&src).ok() == std::fs::canonicalize(&dst).ok()
+                            same_existing_file(&src, &dst)
                         } else {
                             false
                         };
@@ -308,6 +311,27 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                                 .with_context(|| format!("exporting image {}", src.display()))?;
                         }
                     }
+
+                    let mut buf = Vec::new();
+                    for e in &s.entries {
+                        serde_json::to_writer(&mut buf, e)?;
+                        buf.extend_from_slice(b"\n");
+                    }
+                    let tmp = p.with_extension("jsonl.export.tmp");
+                    {
+                        let mut out = std::fs::File::create(&tmp)?;
+                        out.write_all(&buf)?;
+                        out.sync_all()?;
+                    }
+                    if let Err(e) = replace_export_file(&tmp, &p) {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(e);
+                    }
+                    println!(
+                        "exported {} entries (+ images/ if present) → {}",
+                        s.len(),
+                        p.display()
+                    );
                     Ok(())
                 }
                 None => {
@@ -496,6 +520,32 @@ fn put_text_on_clipboard(text: &str) -> Result<()> {
 
 fn put_image_on_clipboard(png: &[u8]) -> Result<()> {
     backend::SystemClipboard::new().set_image_png(png)
+}
+
+fn replace_export_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(src, dst)?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        if dst.exists() {
+            std::fs::remove_file(dst)?;
+        }
+        std::fs::rename(src, dst)?;
+        Ok(())
+    }
+}
+
+fn same_existing_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn apply_set(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
