@@ -148,7 +148,6 @@ mod tests {
             ..Default::default()
         };
         assert!(bad.validate().is_err());
-
     }
 
     #[test]
