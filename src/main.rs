@@ -68,8 +68,9 @@ enum Cmd {
     Copy { id: u64 },
     /// Delete entries: by id, --last, or every unpinned entry (--all).
     Clear {
+        #[arg(conflicts_with_all = ["last", "all"])]
         id: Option<u64>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         last: bool,
         #[arg(long, conflicts_with = "id")]
         all: bool,
@@ -292,7 +293,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                             .parent()
                             .unwrap_or_else(|| std::path::Path::new("."))
                             .join("images");
-                        let _ = copy_dir_recursive(&img_src, &dst);
+                        copy_dir_recursive(&img_src, &dst)?;
                     }
                     Ok(())
                 }
@@ -308,12 +309,20 @@ fn dispatch(cmd: Cmd) -> Result<()> {
         }
 
         Cmd::Import { file } => {
-            let raw = match file {
-                Some(p) => std::fs::read_to_string(&p)?,
+            let (raw, import_root) = match file {
+                Some(p) => {
+                    let raw = std::fs::read_to_string(&p)
+                        .with_context(|| format!("reading {}", p.display()))?;
+                    let root = p
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf();
+                    (raw, Some(root))
+                }
                 None => {
                     let mut b = Vec::new();
                     std::io::stdin().read_to_end(&mut b)?;
-                    String::from_utf8(b)?
+                    (String::from_utf8(b)?, None)
                 }
             };
             let mut s = open_store()?;
@@ -333,6 +342,30 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                     continue;
                 }
                 let mut e = e;
+                if e.kind == Kind::Image {
+                    let src_root = import_root
+                        .as_ref()
+                        .context("image entries can only be imported with --file so sibling images/ payloads can be found")?;
+                    let src = e
+                        .payload_path(src_root)
+                        .context("unsafe image path in import")?;
+                    if !src.is_file() {
+                        bail!("missing image payload {}", src.display());
+                    }
+                    let bytes = std::fs::read(&src)?;
+                    image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+                        .with_context(|| format!("invalid PNG payload {}", src.display()))?;
+                    let dst = e
+                        .payload_path(s.data_dir())
+                        .context("unsafe image path in import")?;
+                    if let Some(parent) = dst.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    if !dst.exists() {
+                        std::fs::write(&dst, &bytes)?;
+                    }
+                    e.size = bytes.len() as u64;
+                }
                 e.pinned = false; // pins are personal to this machine
                 e.id = next_id;
                 next_id += 1;
@@ -340,7 +373,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                 added += 1;
             }
             s.entries.sort_by_key(|e| (e.ts, e.id));
-            s.rewrite()?;
+            s.enforce_limits()?;
             println!("imported {added} new entries, skipped {skipped} already present");
             Ok(())
         }
@@ -380,8 +413,12 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             if let Some(p) = poll_ms {
                 cfg.poll_ms = p.max(50);
             }
-            let w =
-                watcher::Watcher::new(backend::SystemClipboard::new(), Config::data_dir(), &cfg)?;
+            let w = watcher::Watcher::new(
+                backend::SystemClipboard::new(),
+                Config::data_dir(),
+                &cfg,
+            )?
+            .with_poll_override(poll_ms);
             eprintln!(
                 "clipcrate watching (poll={}ms, data={}) — Ctrl+C to stop",
                 cfg.poll_ms,
