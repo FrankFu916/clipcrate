@@ -53,6 +53,10 @@ impl SystemClipboard {
         }
     }
 
+    pub fn probe(&mut self) -> Result<()> {
+        self.with_retry(|_| Ok(()))
+    }
+
     fn decode_png(png: &[u8]) -> Result<ImageData<'static>> {
         let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
             .context("payload is not a valid PNG")?;
