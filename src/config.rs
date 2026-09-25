@@ -1,6 +1,7 @@
 //! User configuration, loaded from `config.toml` in the data directory.
 
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 /// How the watcher deduplicates repeated copies of the same content.
@@ -50,6 +51,7 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Config> {
+        let _lock = lock_config(path)?;
         recover_interrupted_save(path)?;
         let raw = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -64,9 +66,7 @@ impl Config {
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         self.validate()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let _lock = lock_config(path)?;
         let tmp = path.with_extension("toml.tmp");
         {
             use std::io::Write as _;
@@ -110,6 +110,20 @@ impl Config {
     pub fn default_path() -> PathBuf {
         Self::data_dir().join("config.toml")
     }
+}
+
+fn lock_config(path: &Path) -> anyhow::Result<std::fs::File> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("toml.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    Ok(lock)
 }
 
 fn recover_interrupted_save(path: &Path) -> anyhow::Result<()> {
@@ -181,6 +195,15 @@ mod tests {
 
         let missing = Config::load(&dir.join("nope.toml")).unwrap();
         assert_eq!(missing, Config::default());
+    }
+
+    #[test]
+    fn config_lock_file_does_not_change_roundtrip() {
+        let dir = tempfile_dir();
+        let p = dir.join("config.toml");
+        Config::default().save(&p).unwrap();
+        assert!(p.with_extension("toml.lock").exists());
+        assert_eq!(Config::load(&p).unwrap(), Config::default());
     }
 
     #[test]
