@@ -25,6 +25,7 @@ pub struct Watcher<C: Clipboard> {
     poll: Duration,
     filter: Filter,
     dedup: DedupMode,
+    poll_override_ms: Option<u64>,
 }
 
 impl<C: Clipboard> Watcher<C> {
@@ -38,7 +39,16 @@ impl<C: Clipboard> Watcher<C> {
             poll,
             filter: Filter::new(cfg)?,
             dedup: cfg.dedup,
+            poll_override_ms: None,
         })
+    }
+
+    pub fn with_poll_override(mut self, poll_ms: Option<u64>) -> Self {
+        self.poll_override_ms = poll_ms.map(|p| p.max(50));
+        if let Some(p) = self.poll_override_ms {
+            self.poll = Duration::from_millis(p);
+        }
+        self
     }
 
     /// One poll cycle against an open store. Public so tests can step it.
@@ -59,7 +69,8 @@ impl<C: Clipboard> Watcher<C> {
             Ok(cfg) => {
                 self.filter = Filter::new(&cfg)?;
                 self.dedup = cfg.dedup;
-                self.poll = Duration::from_millis(cfg.poll_ms.max(50));
+                let poll_ms = self.poll_override_ms.unwrap_or(cfg.poll_ms.max(50));
+                self.poll = Duration::from_millis(poll_ms);
             }
             Err(e) => {
                 // Keep the last valid configuration rather than killing a long-running
