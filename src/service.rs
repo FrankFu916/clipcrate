@@ -51,8 +51,6 @@ pub fn render_unit(platform: Platform, exe: &str, poll_ms: u64) -> Result<String
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>StandardErrorPath</key>
-    <string>{{}}/Library/Logs/clipcrate.err.log</string>
 </dict>
 </plist>
 "#,
@@ -65,7 +63,7 @@ Description=clipcrate clipboard history watcher
 After=graphical-session.target
 
 [Service]
-ExecStart={exe} watch --poll-ms {poll_ms}
+ExecStart="{exe}" watch --poll-ms {poll_ms}
 Restart=on-failure
 RestartSec=3
 
@@ -141,7 +139,9 @@ pub fn install(poll_ms: u64) -> Result<String> {
                 "/f",
             ]))?;
             // Start watching right away too.
-            let _ = Command::new(&exe).args(["watch"]).spawn();
+            let _ = Command::new(&exe)
+                .args(["watch", "--poll-ms", &poll_ms.to_string()])
+                .spawn();
             Ok("registered HKCU\\...\\Run\\clipcrate and started watcher".into())
         }
     }
@@ -176,6 +176,9 @@ pub fn uninstall() -> Result<String> {
             }
         }
         Platform::Windows => {
+            if !windows_run_value_exists() {
+                return Ok("service was not installed".into());
+            }
             run(Command::new("reg").args([
                 "delete",
                 r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
@@ -199,12 +202,28 @@ pub fn status() -> String {
     )
 }
 
-/// Cheap existence check used by `doctor` (registry probe omitted on Windows).
+/// Cheap existence check used by `doctor`.
 pub fn is_installed() -> bool {
     match detect() {
-        Platform::Windows => false,
+        Platform::Windows => windows_run_value_exists(),
         p => unit_path(p).map(|p| p.exists()).unwrap_or(false),
     }
+}
+
+fn windows_run_value_exists() -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+    Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            "clipcrate",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn run(cmd: &mut Command) -> Result<()> {
@@ -243,7 +262,7 @@ mod tests {
     #[test]
     fn systemd_unit_has_install_section() {
         let u = render_unit(Platform::Linux, "/usr/bin/clipcrate", 500).unwrap();
-        assert!(u.contains("ExecStart=/usr/bin/clipcrate watch --poll-ms 500"));
+        assert!(u.contains("ExecStart=\"/usr/bin/clipcrate\" watch --poll-ms 500"));
         assert!(u.contains("[Install]"));
         assert!(u.contains("WantedBy=default.target"));
     }
