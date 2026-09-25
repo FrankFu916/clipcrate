@@ -26,27 +26,16 @@ impl Store {
     /// Open (creating if needed) the store under `dir` and take the lock.
     /// Single attempt: callers that expect contention choose `open_blocking`.
     pub fn open(dir: &Path) -> Result<Store> {
-        Store::open_inner(dir)
+        Store::open_inner(dir, None)
     }
 
-    /// Retry acquiring the exclusive lock for up to `wait` — for CLI
-    /// commands racing against the watcher or sibling invocations.
+    /// Retry only lock contention for up to `wait`. Parse, permission and
+    /// filesystem errors are returned immediately.
     pub fn open_blocking(dir: &Path, wait: std::time::Duration) -> Result<Store> {
-        let deadline = std::time::Instant::now() + wait;
-        loop {
-            match Store::open_inner(dir) {
-                Ok(s) => return Ok(s),
-                Err(e) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(e);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-        }
+        Store::open_inner(dir, Some(wait))
     }
 
-    fn open_inner(dir: &Path) -> Result<Store> {
+    fn open_inner(dir: &Path, wait: Option<std::time::Duration>) -> Result<Store> {
         fs::create_dir_all(dir)
             .with_context(|| format!("failed to create data dir {}", dir.display()))?;
         let path = dir.join(HISTORY_FILE);
@@ -56,12 +45,23 @@ impl Store {
             .truncate(false)
             .write(true)
             .open(dir.join(LOCK_FILE))?;
-        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| {
-            anyhow::anyhow!(
-                "another clipcrate process holds the store lock ({})",
-                dir.display()
-            )
-        })?;
+        let deadline = wait.map(|w| std::time::Instant::now() + w);
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if deadline.is_some_and(|d| std::time::Instant::now() < d) {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "another clipcrate process holds the store lock ({})",
+                        dir.display()
+                    ));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         recover_interrupted_rewrite(&path)?;
         let entries = load_entries(&path)?;
@@ -459,6 +459,16 @@ mod tests {
         fs::write(dir.join(HISTORY_FILE), "{not json}\n").unwrap();
         let err = Store::open(&dir).unwrap_err().to_string();
         assert!(err.contains("corrupt history line"), "got: {err}");
+    }
+
+    #[test]
+    fn blocking_open_does_not_retry_corrupt_history() {
+        let dir = tmpdir("blocking-corrupt");
+        fs::write(dir.join(HISTORY_FILE), "{not json}\n").unwrap();
+        let err = Store::open_blocking(&dir, std::time::Duration::from_secs(1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("corrupt history line"), "{err}");
     }
 
     #[test]
