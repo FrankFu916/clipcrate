@@ -53,6 +53,10 @@ impl SystemClipboard {
         }
     }
 
+    pub fn probe(&mut self) -> Result<()> {
+        self.with_retry(|_| Ok(()))
+    }
+
     fn decode_png(png: &[u8]) -> Result<ImageData<'static>> {
         let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
             .context("payload is not a valid PNG")?;
@@ -86,12 +90,23 @@ impl Clipboard for SystemClipboard {
             return Ok(None);
         };
         let rgba: Vec<u8> = bytes.into_owned();
-        debug_assert_eq!(rgba.len(), width * height * 4);
+        let expected = width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(4))
+            .context("clipboard image dimensions overflow")?;
+        anyhow::ensure!(
+            rgba.len() == expected,
+            "clipboard image buffer size mismatch: got {}, expected {}",
+            rgba.len(),
+            expected
+        );
+        let width = u32::try_from(width).context("clipboard image width exceeds PNG limits")?;
+        let height = u32::try_from(height).context("clipboard image height exceeds PNG limits")?;
         let mut png = Vec::new();
         PngEncoder {
             data: &rgba,
-            width: width as u32,
-            height: height as u32,
+            width,
+            height,
         }
         .encode(&mut png)?;
         Ok(Some(png))

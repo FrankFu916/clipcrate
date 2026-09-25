@@ -178,6 +178,37 @@ fn config_set_and_deny_pattern() {
 }
 
 #[test]
+fn lowering_max_entries_applies_immediately() {
+    let ctx = Ctx::new("retention");
+    for t in ["one", "two", "three"] {
+        assert!(ctx.run(&["add", t]).status.success());
+    }
+
+    assert!(ctx
+        .run(&["config", "set", "max_entries", "1"])
+        .status
+        .success());
+    let list = ctx.stdout(&["list"]);
+    assert!(!list.contains("one"), "{list}");
+    assert!(!list.contains("two"), "{list}");
+    assert!(list.contains("three"), "{list}");
+}
+
+#[test]
+fn bad_import_does_not_echo_payload() {
+    let ctx = Ctx::new("bad-import");
+    let secret = "super-secret-value-that-must-not-be-echoed";
+    let bad = ctx.home.join("bad.jsonl");
+    std::fs::write(&bad, format!("{{not-json:{secret}}}\n")).unwrap();
+
+    let out = ctx.run(&["import", "--file", bad.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("bad import line 1"), "{stderr}");
+    assert!(!stderr.contains(secret), "{stderr}");
+}
+
+#[test]
 fn invalid_regex_rejected() {
     let ctx = Ctx::new("badregex");
     assert!(!ctx

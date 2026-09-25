@@ -11,6 +11,23 @@ use std::path::{Path, PathBuf};
 pub const HISTORY_FILE: &str = "history.jsonl";
 const LOCK_FILE: &str = "store.lock";
 
+#[derive(Debug)]
+struct LockContended {
+    dir: PathBuf,
+}
+
+impl std::fmt::Display for LockContended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another clipcrate process holds the store lock ({})",
+            self.dir.display()
+        )
+    }
+}
+
+impl std::error::Error for LockContended {}
+
 /// A handle to the on-disk history. All writers take an exclusive `flock`
 /// for the lifetime of the handle so watcher and CLI never interleave.
 #[derive(Debug)]
@@ -26,27 +43,16 @@ impl Store {
     /// Open (creating if needed) the store under `dir` and take the lock.
     /// Single attempt: callers that expect contention choose `open_blocking`.
     pub fn open(dir: &Path) -> Result<Store> {
-        Store::open_inner(dir)
+        Store::open_inner(dir, None)
     }
 
-    /// Retry acquiring the exclusive lock for up to `wait` — for CLI
-    /// commands racing against the watcher or sibling invocations.
+    /// Retry only lock contention for up to `wait`. Parse, permission and
+    /// filesystem errors are returned immediately.
     pub fn open_blocking(dir: &Path, wait: std::time::Duration) -> Result<Store> {
-        let deadline = std::time::Instant::now() + wait;
-        loop {
-            match Store::open_inner(dir) {
-                Ok(s) => return Ok(s),
-                Err(e) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(e);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-        }
+        Store::open_inner(dir, Some(wait))
     }
 
-    fn open_inner(dir: &Path) -> Result<Store> {
+    fn open_inner(dir: &Path, wait: Option<std::time::Duration>) -> Result<Store> {
         fs::create_dir_all(dir)
             .with_context(|| format!("failed to create data dir {}", dir.display()))?;
         let path = dir.join(HISTORY_FILE);
@@ -56,15 +62,33 @@ impl Store {
             .truncate(false)
             .write(true)
             .open(dir.join(LOCK_FILE))?;
-        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| {
-            anyhow::anyhow!(
-                "another clipcrate process holds the store lock ({})",
-                dir.display()
-            )
-        })?;
+        let deadline = wait.map(|w| std::time::Instant::now() + w);
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if deadline.is_some_and(|d| std::time::Instant::now() < d) {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
+                    return Err(LockContended {
+                        dir: dir.to_path_buf(),
+                    }
+                    .into());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
 
+        recover_interrupted_rewrite(&path)?;
         let entries = load_entries(&path)?;
-        let next_id = entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        let next_id = entries
+            .iter()
+            .map(|e| e.id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("history id space exhausted")?;
         Ok(Store {
             dir: dir.to_path_buf(),
             path,
@@ -72,6 +96,10 @@ impl Store {
             entries,
             next_id,
         })
+    }
+
+    pub fn is_lock_contended(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<LockContended>().is_some()
     }
 
     /// Newest entry first.
@@ -89,6 +117,10 @@ impl Store {
 
     pub fn data_dir(&self) -> &Path {
         &self.dir
+    }
+
+    fn retention_limit(&self) -> Result<usize> {
+        Ok(crate::config::Config::load(&self.dir.join("config.toml"))?.max_entries)
     }
 
     /// Record new content. Returns `None` when dedup suppressed the insert
@@ -129,8 +161,10 @@ impl Store {
     }
 
     fn append_text(&mut self, text: &str) -> Result<u64> {
-        let entry = Entry::new_text(self.next_id, now_ms(), text.to_string());
-        self.next_id += 1;
+        let max_entries = self.retention_limit()?;
+        let id = self.next_id;
+        let next_id = id.checked_add(1).context("history id space exhausted")?;
+        let entry = Entry::new_text(id, now_ms(), text.to_string());
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -139,15 +173,17 @@ impl Store {
         f.write_all(b"\n")?;
         f.flush()?;
         self.entries.push(entry);
-        self.evict_and_rewrite()?;
-        Ok(self.next_id - 1)
+        self.next_id = next_id;
+        self.evict_and_rewrite(max_entries)?;
+        Ok(id)
     }
 
     /// Insert a pre-built image entry (PNG already written by the caller).
     pub fn push_image_entry(&mut self, rel_path: &str, size: u64) -> Result<u64> {
-        let entry = Entry::new_image(self.next_id, now_ms(), rel_path, size);
-        let id = entry.id;
-        self.next_id += 1;
+        let max_entries = self.retention_limit()?;
+        let id = self.next_id;
+        let next_id = id.checked_add(1).context("history id space exhausted")?;
+        let entry = Entry::new_image(id, now_ms(), rel_path, size);
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -156,29 +192,38 @@ impl Store {
         f.write_all(b"\n")?;
         f.flush()?;
         self.entries.push(entry);
-        self.evict_and_rewrite()?;
+        self.next_id = next_id;
+        self.evict_and_rewrite(max_entries)?;
         Ok(id)
     }
 
     /// Evict unpinned overflow (oldest first), drop image payloads that are
     /// no longer referenced, and rewrite the file atomically.
-    fn evict_and_rewrite(&mut self) -> Result<()> {
-        let max = crate::config::Config::load(&self.dir.join("config.toml"))
-            .ok()
-            .map(|c| c.max_entries)
-            .unwrap_or(1000);
+    fn evict_and_rewrite(&mut self, max_entries: usize) -> Result<()> {
         let unpinned_count = self.entries.iter().filter(|e| !e.pinned).count();
-        let overflow = unpinned_count.saturating_sub(max);
+        let overflow = unpinned_count.saturating_sub(max_entries);
         for _ in 0..overflow {
-            match self.entries.iter().position(|e| !e.pinned) {
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.pinned)
+                .min_by_key(|(_, e)| (e.ts, e.id))
+                .map(|(idx, _)| idx);
+            match oldest {
                 Some(idx) => {
                     self.entries.remove(idx);
                 }
                 None => break,
             }
         }
-        drop(self.prune_orphan_images());
         self.rewrite()
+    }
+
+    /// Enforce retention limits after bulk mutations such as import.
+    pub fn enforce_limits(&mut self) -> Result<()> {
+        let max_entries = self.retention_limit()?;
+        self.evict_and_rewrite(max_entries)
     }
 
     /// Delete image files nothing references anymore.
@@ -186,7 +231,12 @@ impl Store {
         let img_dir = self.dir.join("images");
         let ok =
             |rd: std::io::Result<fs::DirEntry>| -> Option<PathBuf> { rd.ok().map(|e| e.path()) };
-        for p in fs::read_dir(&img_dir)?.filter_map(ok) {
+        let rd = match fs::read_dir(&img_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for p in rd.filter_map(ok) {
             let name = p.file_name().unwrap().to_string_lossy().to_string();
             if !name.ends_with(".png") {
                 continue;
@@ -216,7 +266,8 @@ impl Store {
             w.flush()?;
             w.get_ref().sync_all()?;
         }
-        fs::rename(&tmp, &self.path)?;
+        replace_file(&tmp, &self.path)?;
+        self.prune_orphan_images()?;
         Ok(())
     }
 
@@ -242,11 +293,7 @@ impl Store {
                 true
             }
         });
-        let deleted = !removed_ids.is_empty();
-        if deleted {
-            drop(self.prune_orphan_images());
-        }
-        deleted
+        !removed_ids.is_empty()
     }
 
     /// Remove all unpinned entries; returns how many were removed.
@@ -272,12 +319,56 @@ impl Store {
     }
 }
 
+fn recover_interrupted_rewrite(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let backup = path.with_extension("jsonl.bak");
+    let tmp = path.with_extension("jsonl.tmp");
+    if backup.exists() {
+        fs::rename(&backup, path)?;
+    } else if tmp.exists() {
+        fs::rename(&tmp, path)?;
+    }
+    Ok(())
+}
+
+fn replace_file(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(src, dst)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        let backup = dst.with_extension("jsonl.bak");
+        let _ = fs::remove_file(&backup);
+        if dst.exists() {
+            fs::rename(dst, &backup)?;
+        }
+        match fs::rename(src, dst) {
+            Ok(()) => {
+                let _ = fs::remove_file(backup);
+                Ok(())
+            }
+            Err(e) => {
+                if backup.exists() {
+                    let _ = fs::rename(&backup, dst);
+                }
+                Err(e.into())
+            }
+        }
+    }
+}
+
 fn load_entries(path: &Path) -> Result<Vec<Entry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
     let f = BufReader::new(File::open(path)?);
     let mut out = Vec::new();
+    let mut ids = std::collections::HashSet::new();
     for (i, line) in f.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -285,6 +376,24 @@ fn load_entries(path: &Path) -> Result<Vec<Entry>> {
         }
         let e: Entry = serde_json::from_str(&line)
             .with_context(|| format!("corrupt history line {} in {}", i + 1, path.display()))?;
+        if !ids.insert(e.id) {
+            anyhow::bail!(
+                "duplicate entry id {} on history line {} in {}",
+                e.id,
+                i + 1,
+                path.display()
+            );
+        }
+        if e.kind == Kind::Image {
+            let root = path.parent().unwrap_or_else(|| Path::new("."));
+            if e.payload_path(root).is_none() {
+                anyhow::bail!(
+                    "unsafe image path on history line {} in {}",
+                    i + 1,
+                    path.display()
+                );
+            }
+        }
         out.push(e);
     }
     Ok(out)
@@ -373,6 +482,37 @@ mod tests {
     }
 
     #[test]
+    fn update_mode_refreshes_lru_age() {
+        let dir = tmpdir("update-lru");
+        crate::config::Config {
+            max_entries: 2,
+            ..Default::default()
+        }
+        .save(&dir.join("config.toml"))
+        .unwrap();
+
+        let mut s = Store::open(&dir).unwrap();
+        s.push_text("a", DedupMode::Update).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        s.push_text("b", DedupMode::Update).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        s.push_text("a", DedupMode::Update).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        s.push_text("c", DedupMode::Update).unwrap();
+
+        let texts: Vec<&str> = s.entries.iter().map(|e| e.text.as_str()).collect();
+        assert!(
+            texts.contains(&"a"),
+            "recently refreshed entry must survive: {texts:?}"
+        );
+        assert!(texts.contains(&"c"));
+        assert!(
+            !texts.contains(&"b"),
+            "least-recently-used entry must be evicted: {texts:?}"
+        );
+    }
+
+    #[test]
     fn delete_pin_clear_and_payload() {
         let dir = tmpdir("del");
         let mut s = Store::open(&dir).unwrap();
@@ -393,11 +533,95 @@ mod tests {
     }
 
     #[test]
+    fn invalid_config_blocks_append_without_data_loss() {
+        let dir = tmpdir("invalid-config-write");
+        let mut s = Store::open(&dir).unwrap();
+        s.push_text("kept", DedupMode::All).unwrap();
+        let before = fs::read_to_string(dir.join(HISTORY_FILE)).unwrap();
+
+        fs::write(dir.join("config.toml"), "min_length = 10\nmax_length = 2\n").unwrap();
+        assert!(s.push_text("must-not-append", DedupMode::All).is_err());
+
+        let after = fs::read_to_string(dir.join(HISTORY_FILE)).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.entries[0].text, "kept");
+    }
+
+    #[test]
     fn corrupt_line_is_reported_not_swallowed() {
         let dir = tmpdir("corrupt");
         fs::write(dir.join(HISTORY_FILE), "{not json}\n").unwrap();
         let err = Store::open(&dir).unwrap_err().to_string();
         assert!(err.contains("corrupt history line"), "got: {err}");
+    }
+
+    #[test]
+    fn blocking_open_does_not_retry_corrupt_history() {
+        let dir = tmpdir("blocking-corrupt");
+        fs::write(dir.join(HISTORY_FILE), "{not json}\n").unwrap();
+        let err = Store::open_blocking(&dir, std::time::Duration::from_secs(1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("corrupt history line"), "{err}");
+    }
+
+    #[test]
+    fn rewrite_prunes_orphan_images_after_commit() {
+        let dir = tmpdir("prune");
+        let images = dir.join("images");
+        fs::create_dir_all(&images).unwrap();
+        fs::write(images.join("orphan.png"), b"not really png").unwrap();
+
+        let s = Store::open(&dir).unwrap();
+        s.rewrite().unwrap();
+        assert!(!images.join("orphan.png").exists());
+    }
+
+    #[test]
+    fn recovers_backup_if_history_is_missing() {
+        let dir = tmpdir("recover");
+        let path = dir.join(HISTORY_FILE);
+        let backup = path.with_extension("jsonl.bak");
+        let e = Entry::new_text(7, now_ms(), "restored");
+        fs::write(&backup, format!("{}\n", serde_json::to_string(&e).unwrap())).unwrap();
+
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.get(7).unwrap().text, "restored");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected() {
+        let dir = tmpdir("duplicate-ids");
+        let a = Entry::new_text(1, now_ms(), "a");
+        let b = Entry::new_text(1, now_ms(), "b");
+        fs::write(
+            dir.join(HISTORY_FILE),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&a).unwrap(),
+                serde_json::to_string(&b).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let err = Store::open(&dir).unwrap_err().to_string();
+        assert!(err.contains("duplicate entry id 1"), "{err}");
+    }
+
+    #[test]
+    fn exhausted_id_space_is_reported() {
+        let dir = tmpdir("id-exhaustion");
+        let e = Entry::new_text(u64::MAX, now_ms(), "last-id");
+        fs::write(
+            dir.join(HISTORY_FILE),
+            format!("{}\n", serde_json::to_string(&e).unwrap()),
+        )
+        .unwrap();
+
+        let err = Store::open(&dir).unwrap_err().to_string();
+        assert!(err.contains("history id space exhausted"), "{err}");
     }
 
     #[test]

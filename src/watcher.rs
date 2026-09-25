@@ -3,6 +3,7 @@
 
 use crate::backend::Clipboard;
 use crate::config::{Config, DedupMode};
+use crate::entry::Kind;
 use crate::filter::Filter;
 use crate::store::Store;
 use anyhow::Result;
@@ -25,6 +26,8 @@ pub struct Watcher<C: Clipboard> {
     poll: Duration,
     filter: Filter,
     dedup: DedupMode,
+    active_config: Config,
+    poll_override_ms: Option<u64>,
 }
 
 impl<C: Clipboard> Watcher<C> {
@@ -38,23 +41,57 @@ impl<C: Clipboard> Watcher<C> {
             poll,
             filter: Filter::new(cfg)?,
             dedup: cfg.dedup,
+            active_config: cfg.clone(),
+            poll_override_ms: None,
         })
     }
 
-    /// One poll cycle against an open store. Public so tests can step it.
-    pub fn tick(&mut self, store: &mut Store) -> Result<Tick> {
-        // Reload rules that may have changed on disk.
-        if let Ok(cfg) = Config::load(&self.store_dir.join("config.toml")) {
-            self.filter = Filter::new(&cfg)?;
-            self.dedup = cfg.dedup;
-            self.poll = Duration::from_millis(cfg.poll_ms.max(50));
+    pub fn with_poll_override(mut self, poll_ms: Option<u64>) -> Self {
+        self.poll_override_ms = poll_ms.map(|p| p.max(50));
+        if let Some(p) = self.poll_override_ms {
+            self.poll = Duration::from_millis(p);
         }
+        self
+    }
+
+    /// One poll cycle against an open store. Public so tests can step it.
+    #[cfg(test)]
+    pub fn tick(&mut self, store: &mut Store) -> Result<Tick> {
+        let _ = self.reload_config()?;
 
         if let Some(png) = self.clip.get_image_png()? {
             return self.record_image(store, png);
         }
 
         let text = self.clip.get_text()?;
+        self.record_text(store, text)
+    }
+
+    fn reload_config(&mut self) -> Result<bool> {
+        let path = self.store_dir.join("config.toml");
+        match Config::load(&path) {
+            Ok(cfg) => {
+                let capture_rules_changed = cfg.min_length != self.active_config.min_length
+                    || cfg.max_length != self.active_config.max_length
+                    || cfg.deny_patterns != self.active_config.deny_patterns
+                    || cfg.dedup != self.active_config.dedup;
+                self.filter = Filter::new(&cfg)?;
+                self.dedup = cfg.dedup;
+                let poll_ms = self.poll_override_ms.unwrap_or(cfg.poll_ms.max(50));
+                self.poll = Duration::from_millis(poll_ms);
+                self.active_config = cfg;
+                Ok(capture_rules_changed)
+            }
+            Err(e) => {
+                // Keep the last valid configuration rather than killing a long-running
+                // watcher because a config edit was momentarily incomplete.
+                eprintln!("clipcrate: ignoring invalid config reload: {e:#}");
+                Ok(false)
+            }
+        }
+    }
+
+    fn record_text(&mut self, store: &mut Store, text: String) -> Result<Tick> {
         if text.is_empty() || !self.filter.accepts(&text)? {
             return Ok(Tick::Ignored);
         }
@@ -67,48 +104,118 @@ impl<C: Clipboard> Watcher<C> {
 
     fn record_image(&mut self, store: &mut Store, png: Vec<u8>) -> Result<Tick> {
         use std::io::Write as _;
-        let digest = blake3_hex(&png);
+        let digest = content_hash(&png);
         let img_dir = self.store_dir.join("images");
         std::fs::create_dir_all(&img_dir)?;
         let rel = format!("images/{digest}.png");
         let abs = self.store_dir.join(&rel);
-        if !abs.exists() {
-            let mut f = std::fs::File::create(&abs)?;
-            f.write_all(&png)?;
+        if abs.exists() {
+            let existing = std::fs::read(&abs)?;
+            anyhow::ensure!(
+                existing == png,
+                "image payload collision at {}",
+                abs.display()
+            );
+        } else {
+            let tmp = abs.with_extension("png.tmp");
+            {
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(&png)?;
+                f.sync_all()?;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &abs) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
         }
-        // Identical image re-copied: bump existing entry instead of duplicating.
-        if let Some(e) = store.entries.iter_mut().rev().find(|e| e.text == rel) {
-            e.ts = crate::entry::now_ms();
-            store.rewrite()?;
-            return Ok(Tick::Deduped);
+        match self.dedup {
+            DedupMode::All => {
+                store.push_image_entry(&rel, png.len() as u64)?;
+                Ok(Tick::Recorded)
+            }
+            DedupMode::Bump => {
+                if let Some(i) = store
+                    .entries
+                    .iter()
+                    .rposition(|e| e.kind == Kind::Image && e.text == rel)
+                {
+                    let mut e = store.entries.remove(i);
+                    e.ts = crate::entry::now_ms();
+                    store.entries.push(e);
+                    store.rewrite()?;
+                    Ok(Tick::Deduped)
+                } else {
+                    store.push_image_entry(&rel, png.len() as u64)?;
+                    Ok(Tick::Recorded)
+                }
+            }
+            DedupMode::Update => {
+                if let Some(e) = store
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find(|e| e.kind == Kind::Image && e.text == rel)
+                {
+                    e.ts = crate::entry::now_ms();
+                    store.rewrite()?;
+                    Ok(Tick::Deduped)
+                } else {
+                    store.push_image_entry(&rel, png.len() as u64)?;
+                    Ok(Tick::Recorded)
+                }
+            }
         }
-        store.push_image_entry(&rel, png.len() as u64)?;
-        Ok(Tick::Recorded)
     }
 
     /// Run until `stop` is set. Sleeps between polls; each tick opens the
     /// store briefly so CLI commands can interleave between ticks.
     pub fn run(mut self, stop: Arc<AtomicBool>) -> Result<()> {
-        let mut last_text = String::new();
+        let mut last_seen: Option<String> = None;
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
+
+            if self.reload_config()? {
+                // A filter or dedup change can make the unchanged clipboard eligible again.
+                last_seen = None;
+            }
+
+            let snapshot = match self.clip.get_image_png() {
+                Ok(Some(png)) => Some((format!("i:{}", content_hash(&png)), Some(png), None)),
+                Ok(None) => match self.clip.get_text() {
+                    Ok(text) => Some((format!("t:{text}"), None, Some(text))),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            };
+
+            let Some((fingerprint, image, text)) = snapshot else {
+                std::thread::sleep(self.poll);
+                continue;
+            };
+            if last_seen.as_deref() == Some(fingerprint.as_str()) {
+                std::thread::sleep(self.poll);
+                continue;
+            }
+
             let mut store = match Store::open(&self.store_dir) {
                 Ok(s) => s,
-                Err(_) => {
-                    // Lock held by a CLI command right now: skip this tick.
+                Err(e) if Store::is_lock_contended(&e) => {
+                    // Lock held by a CLI command right now: retry this same snapshot later.
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
+                Err(e) => return Err(e),
             };
-            let text = self.clip.get_text().unwrap_or_default();
-            if text != last_text && !text.is_empty() {
-                let before = store.len();
-                let _ = self.tick(&mut store);
-                if store.len() != before || self.dedup != DedupMode::All {
-                    last_text = text;
-                }
+
+            let result = if let Some(png) = image {
+                self.record_image(&mut store, png)
+            } else {
+                self.record_text(&mut store, text.unwrap_or_default())
+            };
+            if result.is_ok() {
+                last_seen = Some(fingerprint);
             }
             drop(store);
             std::thread::sleep(self.poll);
@@ -116,17 +223,16 @@ impl<C: Clipboard> Watcher<C> {
     }
 }
 
-/// FNV-1a hex digest — enough to dedupe image payloads locally without
-/// pulling in a crypto stack.
-fn blake3_hex(data: &[u8]) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
+/// 128-bit FNV-1a content fingerprint used for local image deduplication.
+fn content_hash(data: &[u8]) -> String {
+    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013b;
     for b in data {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+        h ^= *b as u128;
+        h = h.wrapping_mul(PRIME);
     }
-    // Fold in length to avoid trivial prefix collisions.
-    h ^= data.len() as u64;
-    format!("{h:016x}{:016x}", h.swap_bytes())
+    h ^= data.len() as u128;
+    format!("{h:032x}")
 }
 
 #[cfg(test)]
@@ -235,6 +341,56 @@ mod tests {
     }
 
     #[test]
+    fn existing_image_payload_must_match_hash_target() {
+        let dir = tmpdir("img-collision");
+        let png: Vec<u8> = {
+            let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([11, 12, 13, 255]));
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let digest = content_hash(&png);
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(images.join(format!("{digest}.png")), b"corrupt").unwrap();
+
+        let clip = shared("");
+        let mut w = w(clip, &dir);
+        let mut s = Store::open(&dir).unwrap();
+        let err = w.record_image(&mut s, png).unwrap_err().to_string();
+        assert!(err.contains("image payload collision"), "{err}");
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn image_dedup_all_records_each_event_but_reuses_payload() {
+        let dir = tmpdir("img-all");
+        let png: Vec<u8> = {
+            let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([5, 6, 7, 255]));
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let fake = FakeClipboard {
+            png: Some(png.clone()),
+            ..Default::default()
+        };
+        let clip: Clip = std::sync::Arc::new(std::sync::Mutex::new(fake));
+        let mut w = w(clip, &dir);
+        w.dedup = DedupMode::All;
+        let mut s = Store::open(&dir).unwrap();
+
+        assert_eq!(w.record_image(&mut s, png.clone()).unwrap(), Tick::Recorded);
+        assert_eq!(w.record_image(&mut s, png).unwrap(), Tick::Recorded);
+        assert_eq!(s.len(), 2);
+        assert_eq!(std::fs::read_dir(dir.join("images")).unwrap().count(), 1);
+    }
+
+    #[test]
     fn run_loop_persists_across_reopens() {
         // Drive run()'s inner logic via repeated tick + reopen, which is what
         // run() does each cycle; actual thread timing is covered by e2e tests.
@@ -251,10 +407,35 @@ mod tests {
     }
 
     #[test]
+    fn reload_reports_capture_rule_changes_only() {
+        let dir = tmpdir("reload");
+        let clip = shared("same clipboard");
+        let base = Config {
+            poll_ms: 50,
+            ..Default::default()
+        };
+        base.save(&dir.join("config.toml")).unwrap();
+        let mut w = Watcher::new(clip, dir.clone(), &base).unwrap();
+
+        assert!(!w.reload_config().unwrap());
+
+        let mut changed = base.clone();
+        changed.preview_lines = 20;
+        changed.save(&dir.join("config.toml")).unwrap();
+        assert!(!w.reload_config().unwrap());
+
+        changed.deny_patterns.push("^blocked$".into());
+        changed.save(&dir.join("config.toml")).unwrap();
+        assert!(w.reload_config().unwrap());
+        assert!(!w.reload_config().unwrap());
+    }
+
+    #[test]
     fn identical_images_get_same_name() {
-        let a = blake3_hex(b"same bytes");
-        let b = blake3_hex(b"same bytes");
+        let a = content_hash(b"same bytes");
+        let b = content_hash(b"same bytes");
         assert_eq!(a, b);
-        assert_ne!(a, blake3_hex(b"other bytes"));
+        assert_ne!(a, content_hash(b"other bytes"));
+        assert_eq!(a.len(), 32);
     }
 }

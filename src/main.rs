@@ -68,8 +68,9 @@ enum Cmd {
     Copy { id: u64 },
     /// Delete entries: by id, --last, or every unpinned entry (--all).
     Clear {
+        #[arg(conflicts_with_all = ["last", "all"])]
         id: Option<u64>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         last: bool,
         #[arg(long, conflicts_with = "id")]
         all: bool,
@@ -275,25 +276,65 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             let s = open_store()?;
             match out {
                 Some(p) => {
+                    let history_path = s.data_dir().join(store::HISTORY_FILE);
+                    let config_path = Config::default_path();
+                    if same_existing_file(&p, &history_path)
+                        || same_existing_file(&p, &config_path)
+                    {
+                        bail!("refusing to overwrite clipcrate's internal data file");
+                    }
+
+                    let export_root = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+                    if !export_root.as_os_str().is_empty() {
+                        std::fs::create_dir_all(export_root)?;
+                    }
+                    // Validate and copy every referenced image before publishing
+                    // the JSONL manifest, so a failed image export cannot leave
+                    // behind an apparently complete backup manifest.
+                    for e in s.entries.iter().filter(|e| e.kind == Kind::Image) {
+                        let src = e
+                            .payload_path(s.data_dir())
+                            .context("unsafe image path in history")?;
+                        if !src.is_file() {
+                            bail!("missing image payload {}", src.display());
+                        }
+                        let file_name =
+                            src.file_name().context("image payload has no file name")?;
+                        let dst = export_root.join("images").join(file_name);
+                        if let Some(parent) = dst.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        let same_file = if dst.exists() {
+                            same_existing_file(&src, &dst)
+                        } else {
+                            false
+                        };
+                        if !same_file {
+                            std::fs::copy(&src, &dst)
+                                .with_context(|| format!("exporting image {}", src.display()))?;
+                        }
+                    }
+
                     let mut buf = Vec::new();
                     for e in &s.entries {
                         serde_json::to_writer(&mut buf, e)?;
                         buf.extend_from_slice(b"\n");
                     }
-                    std::fs::write(&p, &buf)?;
+                    let tmp = p.with_extension("jsonl.export.tmp");
+                    {
+                        let mut out = std::fs::File::create(&tmp)?;
+                        out.write_all(&buf)?;
+                        out.sync_all()?;
+                    }
+                    if let Err(e) = replace_export_file(&tmp, &p) {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(e);
+                    }
                     println!(
                         "exported {} entries (+ images/ if present) → {}",
                         s.len(),
                         p.display()
                     );
-                    let img_src = s.data_dir().join("images");
-                    if img_src.exists() {
-                        let dst = p
-                            .parent()
-                            .unwrap_or_else(|| std::path::Path::new("."))
-                            .join("images");
-                        let _ = copy_dir_recursive(&img_src, &dst);
-                    }
                     Ok(())
                 }
                 None => {
@@ -308,23 +349,41 @@ fn dispatch(cmd: Cmd) -> Result<()> {
         }
 
         Cmd::Import { file } => {
-            let raw = match file {
-                Some(p) => std::fs::read_to_string(&p)?,
+            let (raw, import_root) = match file {
+                Some(p) => {
+                    let raw = std::fs::read_to_string(&p)
+                        .with_context(|| format!("reading {}", p.display()))?;
+                    let root = p
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf();
+                    (raw, Some(root))
+                }
                 None => {
                     let mut b = Vec::new();
                     std::io::stdin().read_to_end(&mut b)?;
-                    String::from_utf8(b)?
+                    (String::from_utf8(b)?, None)
                 }
             };
             let mut s = open_store()?;
             // Import targets may be another machine's export: ids collide,
             // so dedup by content and renumber every imported entry.
-            let mut next_id = s.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+            let mut next_id = s
+                .entries
+                .iter()
+                .map(|e| e.id)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .context("history id space exhausted")?;
             let mut added = 0usize;
             let mut skipped = 0usize;
-            for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+            for (line_no, line) in raw.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
                 let e: entry::Entry = serde_json::from_str(line)
-                    .with_context(|| format!("bad import line: {line}"))?;
+                    .with_context(|| format!("bad import line {}", line_no + 1))?;
                 if s.entries
                     .iter()
                     .any(|x| x.kind == e.kind && x.text == e.text)
@@ -333,14 +392,51 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                     continue;
                 }
                 let mut e = e;
+                if e.kind == Kind::Image {
+                    let src_root = import_root
+                        .as_ref()
+                        .context("image entries can only be imported with --file so sibling images/ payloads can be found")?;
+                    let src = e
+                        .payload_path(src_root)
+                        .context("unsafe image path in import")?;
+                    if !src.is_file() {
+                        bail!("missing image payload {}", src.display());
+                    }
+                    let bytes = std::fs::read(&src)?;
+                    image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+                        .with_context(|| format!("invalid PNG payload {}", src.display()))?;
+                    let dst = e
+                        .payload_path(s.data_dir())
+                        .context("unsafe image path in import")?;
+                    if let Some(parent) = dst.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    if dst.exists() {
+                        let existing = std::fs::read(&dst)?;
+                        if existing != bytes {
+                            bail!("image payload collision at {}", dst.display());
+                        }
+                    } else {
+                        let tmp = dst.with_extension("png.import.tmp");
+                        {
+                            let mut out = std::fs::File::create(&tmp)?;
+                            out.write_all(&bytes)?;
+                            out.sync_all()?;
+                        }
+                        std::fs::rename(&tmp, &dst)?;
+                    }
+                    e.size = bytes.len() as u64;
+                }
                 e.pinned = false; // pins are personal to this machine
                 e.id = next_id;
-                next_id += 1;
+                next_id = next_id
+                    .checked_add(1)
+                    .context("history id space exhausted")?;
                 s.entries.push(e);
                 added += 1;
             }
             s.entries.sort_by_key(|e| (e.ts, e.id));
-            s.rewrite()?;
+            s.enforce_limits()?;
             println!("imported {added} new entries, skipped {skipped} already present");
             Ok(())
         }
@@ -353,14 +449,21 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                 Ok(())
             }
             ConfigAction::Set { key, value } => {
+                // The store lock serializes read-modify-write config commands
+                // with each other and with watcher persistence.
+                let mut store = open_store()?;
                 let mut cfg = load_config()?;
                 apply_set(&mut cfg, &key, &value)?;
                 cfg.save(&Config::default_path())?;
-                println!("{key} = {value}");
+                if key == "max_entries" {
+                    store.enforce_limits()?;
+                }
+                println!("{key} updated");
                 Ok(())
             }
             ConfigAction::DenyAdd { pattern } => {
                 regex::Regex::new(&pattern).context("invalid regex")?;
+                let _store = open_store()?;
                 let mut cfg = load_config()?;
                 if cfg.deny_patterns.contains(&pattern) {
                     println!("pattern already present");
@@ -381,7 +484,8 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                 cfg.poll_ms = p.max(50);
             }
             let w =
-                watcher::Watcher::new(backend::SystemClipboard::new(), Config::data_dir(), &cfg)?;
+                watcher::Watcher::new(backend::SystemClipboard::new(), Config::data_dir(), &cfg)?
+                    .with_poll_override(poll_ms);
             eprintln!(
                 "clipcrate watching (poll={}ms, data={}) — Ctrl+C to stop",
                 cfg.poll_ms,
@@ -421,18 +525,42 @@ fn put_image_on_clipboard(png: &[u8]) -> Result<()> {
     backend::SystemClipboard::new().set_image_png(png)
 }
 
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for e in std::fs::read_dir(src)? {
-        let e = e?;
-        let to = dst.join(e.file_name());
-        if e.path().is_dir() {
-            copy_dir_recursive(&e.path(), &to)?;
-        } else {
-            std::fs::copy(e.path(), &to)?;
+fn replace_export_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(src, dst)?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let backup = dst.with_extension("export.bak");
+        let _ = std::fs::remove_file(&backup);
+        if dst.exists() {
+            std::fs::rename(dst, &backup)?;
+        }
+        match std::fs::rename(src, dst) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(backup);
+                Ok(())
+            }
+            Err(e) => {
+                if backup.exists() {
+                    let _ = std::fs::rename(&backup, dst);
+                }
+                Err(e.into())
+            }
         }
     }
-    Ok(())
+}
+
+fn same_existing_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn apply_set(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
@@ -469,8 +597,8 @@ fn doctor() -> Result<()> {
     println!("  version  : {}", env!("CARGO_PKG_VERSION"));
 
     let mut cb = backend::SystemClipboard::new();
-    match cb.get_text() {
-        Ok(_) => println!("  clipboard: OK"),
+    match cb.probe() {
+        Ok(()) => println!("  clipboard: OK"),
         Err(e) => {
             problems += 1;
             println!("  clipboard: FAIL ({e})");

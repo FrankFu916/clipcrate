@@ -1,6 +1,7 @@
 //! User configuration, loaded from `config.toml` in the data directory.
 
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 /// How the watcher deduplicates repeated copies of the same content.
@@ -50,20 +51,39 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Config> {
+        let _lock = lock_config(path)?;
+        recover_interrupted_save(path)?;
         let raw = match std::fs::read_to_string(path) {
             Ok(s) => s,
-            Err(_) => return Ok(Config::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) => return Err(e.into()),
         };
         // Unknown keys are ignored so newer configs don't break older builds.
         let cfg: Config = toml::from_str(&raw)?;
+        cfg.validate()?;
         Ok(cfg)
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        self.validate()?;
+        let _lock = lock_config(path)?;
+        let tmp = path.with_extension("toml.tmp");
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(toml::to_string_pretty(self)?.as_bytes())?;
+            f.sync_all()?;
         }
-        std::fs::write(path, toml::to_string_pretty(self)?)?;
+        replace_file(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.min_length <= self.max_length,
+            "min_length must not exceed max_length"
+        );
+        self.compile_denies()?;
         Ok(())
     }
 
@@ -89,6 +109,63 @@ impl Config {
 
     pub fn default_path() -> PathBuf {
         Self::data_dir().join("config.toml")
+    }
+}
+
+fn lock_config(path: &Path) -> anyhow::Result<std::fs::File> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("toml.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    Ok(lock)
+}
+
+fn recover_interrupted_save(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let backup = path.with_extension("toml.bak");
+    let tmp = path.with_extension("toml.tmp");
+    if backup.exists() {
+        std::fs::rename(&backup, path)?;
+    } else if tmp.exists() {
+        std::fs::rename(&tmp, path)?;
+    }
+    Ok(())
+}
+
+fn replace_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(src, dst)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        let backup = dst.with_extension("toml.bak");
+        let _ = std::fs::remove_file(&backup);
+        if dst.exists() {
+            std::fs::rename(dst, &backup)?;
+        }
+        match std::fs::rename(src, dst) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(backup);
+                Ok(())
+            }
+            Err(e) => {
+                if backup.exists() {
+                    let _ = std::fs::rename(&backup, dst);
+                }
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -121,6 +198,25 @@ mod tests {
     }
 
     #[test]
+    fn config_lock_file_does_not_change_roundtrip() {
+        let dir = tempfile_dir();
+        let p = dir.join("config.toml");
+        Config::default().save(&p).unwrap();
+        assert!(p.with_extension("toml.lock").exists());
+        assert_eq!(Config::load(&p).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn invalid_ranges_are_rejected() {
+        let bad = Config {
+            min_length: 10,
+            max_length: 2,
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
     fn deny_patterns_compile_or_fail() {
         let bad = Config {
             deny_patterns: vec!["sk-[a-zA-Z0-9]{10,}".into(), "(bad".into()],
@@ -135,7 +231,14 @@ mod tests {
     }
 
     fn tempfile_dir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("clipcrate-test-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!(
+            "clipcrate-config-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

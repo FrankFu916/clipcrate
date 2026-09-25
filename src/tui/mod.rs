@@ -17,6 +17,18 @@ use ratatui::{
     Frame, Terminal,
 };
 
+fn sanitize_terminal_line(line: &str) -> String {
+    line.chars()
+        .map(|c| {
+            if c.is_control() && c != '\t' {
+                '�'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 pub struct Picker<'a> {
     store: &'a mut Store,
     query: String,
@@ -116,7 +128,10 @@ impl<'a> Picker<'a> {
                         });
                         self.store.rewrite()?;
                     }
-                    KeyCode::Delete => {
+                    KeyCode::Delete | KeyCode::Char('d')
+                        if key.code == KeyCode::Delete
+                            || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         self.with_selected(|s, id| {
                             s.delete(id);
                         });
@@ -144,15 +159,20 @@ impl<'a> Picker<'a> {
 
     fn render(&mut self, f: &mut Frame) {
         let now = crate::entry::now_ms();
-        let preview_lines =
+        let configured_preview_lines =
             crate::config::Config::load(&crate::config::Config::data_dir().join("config.toml"))
                 .map(|c| c.preview_lines)
                 .unwrap_or(8);
+        let preview_lines = configured_preview_lines
+            .min(f.area().height.saturating_sub(8) as usize);
+        let preview_height = u16::try_from(preview_lines)
+            .unwrap_or(0)
+            .saturating_add(2);
 
         let outer = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(preview_lines as u16 + 2),
+            Constraint::Length(preview_height),
         ])
         .split(f.area());
 
@@ -215,6 +235,7 @@ impl<'a> Picker<'a> {
                         .text
                         .lines()
                         .take(preview_lines)
+                        .map(sanitize_terminal_line)
                         .map(Line::from)
                         .chain(std::iter::once(Line::from("…".dim())))
                         .take(
@@ -242,22 +263,45 @@ impl<'a> Picker<'a> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::sanitize_terminal_line;
+
+    #[test]
+    fn terminal_preview_replaces_control_characters() {
+        assert_eq!(
+            sanitize_terminal_line("safe\u{1b}[31m\u{7}text\tcolumn"),
+            "safe�[31m�text\tcolumn"
+        );
+    }
+}
+
 /// Public entry point: sets up the alternate screen and runs the picker.
 /// The terminal is restored even on error.
 pub fn run_picker(store: &mut Store) -> Result<Option<u64>> {
-    use ratatui::crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    use ratatui::crossterm::{
+        cursor::Show,
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
+
+    struct RestoreTerminal;
+    impl Drop for RestoreTerminal {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+            let mut stdout = std::io::stdout();
+            let _ = ratatui::crossterm::execute!(stdout, LeaveAlternateScreen, Show);
+        }
+    }
+
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    ratatui::crossterm::execute!(stdout, EnterAlternateScreen)?;
+    if let Err(e) = ratatui::crossterm::execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e.into());
+    }
+    let _guard = RestoreTerminal;
+
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend)?;
-
-    let res = Picker::new(store).run_inner(&mut term);
-
-    disable_raw_mode()?;
-    ratatui::crossterm::execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    term.show_cursor()?;
-    res
+    Picker::new(store).run_inner(&mut term)
 }

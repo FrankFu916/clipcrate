@@ -4,7 +4,8 @@
 //! `images/<hash>.png` next to the store file and referenced by relative path.
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Kind of payload captured from the clipboard.
@@ -107,10 +108,16 @@ impl Entry {
 
     /// Resolve the absolute path of the payload for image entries.
     pub fn payload_path(&self, store_dir: &Path) -> Option<PathBuf> {
-        match self.kind {
-            Kind::Text => None,
-            Kind::Image => Some(store_dir.join(&self.text)),
+        if self.kind != Kind::Image {
+            return None;
         }
+        let rel = Path::new(&self.text);
+        let mut parts = rel.components();
+        let valid = matches!(parts.next(), Some(Component::Normal(p)) if p == OsStr::new("images"))
+            && matches!(parts.next(), Some(Component::Normal(_)))
+            && parts.next().is_none()
+            && rel.extension() == Some(OsStr::new("png"));
+        valid.then(|| store_dir.join(rel))
     }
 }
 
@@ -120,4 +127,27 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_payload_paths_cannot_escape_store() {
+        let root = Path::new("/tmp/clipcrate");
+        let ok = Entry::new_image(1, 0, "images/abc.png", 1);
+        assert_eq!(ok.payload_path(root), Some(root.join("images/abc.png")));
+
+        for bad in [
+            "../secret.png",
+            "images/../secret.png",
+            "/tmp/secret.png",
+            "images/nested/secret.png",
+            "images/not-png.txt",
+        ] {
+            let e = Entry::new_image(1, 0, bad, 1);
+            assert!(e.payload_path(root).is_none(), "{bad} must be rejected");
+        }
+    }
 }
