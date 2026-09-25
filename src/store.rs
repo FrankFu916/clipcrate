@@ -82,7 +82,13 @@ impl Store {
 
         recover_interrupted_rewrite(&path)?;
         let entries = load_entries(&path)?;
-        let next_id = entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        let next_id = entries
+            .iter()
+            .map(|e| e.id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("history id space exhausted")?;
         Ok(Store {
             dir: dir.to_path_buf(),
             path,
@@ -151,8 +157,9 @@ impl Store {
     }
 
     fn append_text(&mut self, text: &str) -> Result<u64> {
-        let entry = Entry::new_text(self.next_id, now_ms(), text.to_string());
-        self.next_id += 1;
+        let id = self.next_id;
+        let next_id = id.checked_add(1).context("history id space exhausted")?;
+        let entry = Entry::new_text(id, now_ms(), text.to_string());
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -161,15 +168,16 @@ impl Store {
         f.write_all(b"\n")?;
         f.flush()?;
         self.entries.push(entry);
+        self.next_id = next_id;
         self.evict_and_rewrite()?;
-        Ok(self.next_id - 1)
+        Ok(id)
     }
 
     /// Insert a pre-built image entry (PNG already written by the caller).
     pub fn push_image_entry(&mut self, rel_path: &str, size: u64) -> Result<u64> {
-        let entry = Entry::new_image(self.next_id, now_ms(), rel_path, size);
-        let id = entry.id;
-        self.next_id += 1;
+        let id = self.next_id;
+        let next_id = id.checked_add(1).context("history id space exhausted")?;
+        let entry = Entry::new_image(id, now_ms(), rel_path, size);
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -178,6 +186,7 @@ impl Store {
         f.write_all(b"\n")?;
         f.flush()?;
         self.entries.push(entry);
+        self.next_id = next_id;
         self.evict_and_rewrite()?;
         Ok(id)
     }
@@ -356,6 +365,7 @@ fn load_entries(path: &Path) -> Result<Vec<Entry>> {
     }
     let f = BufReader::new(File::open(path)?);
     let mut out = Vec::new();
+    let mut ids = std::collections::HashSet::new();
     for (i, line) in f.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -363,6 +373,14 @@ fn load_entries(path: &Path) -> Result<Vec<Entry>> {
         }
         let e: Entry = serde_json::from_str(&line)
             .with_context(|| format!("corrupt history line {} in {}", i + 1, path.display()))?;
+        if !ids.insert(e.id) {
+            anyhow::bail!(
+                "duplicate entry id {} on history line {} in {}",
+                e.id,
+                i + 1,
+                path.display()
+            );
+        }
         if e.kind == Kind::Image {
             let root = path.parent().unwrap_or_else(|| Path::new("."));
             if e.payload_path(root).is_none() {
@@ -552,6 +570,39 @@ mod tests {
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.get(7).unwrap().text, "restored");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected() {
+        let dir = tmpdir("duplicate-ids");
+        let a = Entry::new_text(1, now_ms(), "a");
+        let b = Entry::new_text(1, now_ms(), "b");
+        fs::write(
+            dir.join(HISTORY_FILE),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&a).unwrap(),
+                serde_json::to_string(&b).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let err = Store::open(&dir).unwrap_err().to_string();
+        assert!(err.contains("duplicate entry id 1"), "{err}");
+    }
+
+    #[test]
+    fn exhausted_id_space_is_reported() {
+        let dir = tmpdir("id-exhaustion");
+        let e = Entry::new_text(u64::MAX, now_ms(), "last-id");
+        fs::write(
+            dir.join(HISTORY_FILE),
+            format!("{}\n", serde_json::to_string(&e).unwrap()),
+        )
+        .unwrap();
+
+        let err = Store::open(&dir).unwrap_err().to_string();
+        assert!(err.contains("history id space exhausted"), "{err}");
     }
 
     #[test]
