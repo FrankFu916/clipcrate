@@ -422,11 +422,13 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                 Ok(())
             }
             ConfigAction::Set { key, value } => {
+                // The store lock serializes read-modify-write config commands
+                // with each other and with watcher persistence.
+                let mut store = open_store()?;
                 let mut cfg = load_config()?;
                 apply_set(&mut cfg, &key, &value)?;
                 cfg.save(&Config::default_path())?;
                 if key == "max_entries" {
-                    let mut store = open_store()?;
                     store.enforce_limits()?;
                 }
                 println!("{key} updated");
@@ -434,6 +436,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             }
             ConfigAction::DenyAdd { pattern } => {
                 regex::Regex::new(&pattern).context("invalid regex")?;
+                let _store = open_store()?;
                 let mut cfg = load_config()?;
                 if cfg.deny_patterns.contains(&pattern) {
                     println!("pattern already present");
