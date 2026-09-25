@@ -287,13 +287,22 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                         s.len(),
                         p.display()
                     );
-                    let img_src = s.data_dir().join("images");
-                    if img_src.exists() {
-                        let dst = p
-                            .parent()
-                            .unwrap_or_else(|| std::path::Path::new("."))
-                            .join("images");
-                        copy_dir_recursive(&img_src, &dst)?;
+                    let export_root = p
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    for e in s.entries.iter().filter(|e| e.kind == Kind::Image) {
+                        let src = e
+                            .payload_path(s.data_dir())
+                            .context("unsafe image path in history")?;
+                        let file_name = src
+                            .file_name()
+                            .context("image payload has no file name")?;
+                        let dst = export_root.join("images").join(file_name);
+                        if let Some(parent) = dst.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::copy(&src, &dst)
+                            .with_context(|| format!("exporting image {}", src.display()))?;
                     }
                     Ok(())
                 }
@@ -328,7 +337,14 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             let mut s = open_store()?;
             // Import targets may be another machine's export: ids collide,
             // so dedup by content and renumber every imported entry.
-            let mut next_id = s.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+            let mut next_id = s
+                .entries
+                .iter()
+                .map(|e| e.id)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .context("history id space exhausted")?;
             let mut added = 0usize;
             let mut skipped = 0usize;
             for (line_no, line) in raw.lines().enumerate() {
@@ -364,14 +380,27 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                     if let Some(parent) = dst.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    if !dst.exists() {
-                        std::fs::write(&dst, &bytes)?;
+                    if dst.exists() {
+                        let existing = std::fs::read(&dst)?;
+                        if existing != bytes {
+                            bail!("image payload collision at {}", dst.display());
+                        }
+                    } else {
+                        let tmp = dst.with_extension("png.import.tmp");
+                        {
+                            let mut out = std::fs::File::create(&tmp)?;
+                            out.write_all(&bytes)?;
+                            out.sync_all()?;
+                        }
+                        std::fs::rename(&tmp, &dst)?;
                     }
                     e.size = bytes.len() as u64;
                 }
                 e.pinned = false; // pins are personal to this machine
                 e.id = next_id;
-                next_id += 1;
+                next_id = next_id
+                    .checked_add(1)
+                    .context("history id space exhausted")?;
                 s.entries.push(e);
                 added += 1;
             }
@@ -460,20 +489,6 @@ fn put_text_on_clipboard(text: &str) -> Result<()> {
 
 fn put_image_on_clipboard(png: &[u8]) -> Result<()> {
     backend::SystemClipboard::new().set_image_png(png)
-}
-
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for e in std::fs::read_dir(src)? {
-        let e = e?;
-        let to = dst.join(e.file_name());
-        if e.path().is_dir() {
-            copy_dir_recursive(&e.path(), &to)?;
-        } else {
-            std::fs::copy(e.path(), &to)?;
-        }
-    }
-    Ok(())
 }
 
 fn apply_set(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
