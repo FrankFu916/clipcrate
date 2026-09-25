@@ -116,8 +116,7 @@ impl<'a> Picker<'a> {
                         });
                         self.store.rewrite()?;
                     }
-                    KeyCode::Delete
-                    | KeyCode::Char('d')
+                    KeyCode::Delete | KeyCode::Char('d')
                         if key.code == KeyCode::Delete
                             || key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
