@@ -109,9 +109,24 @@ impl<C: Clipboard> Watcher<C> {
         std::fs::create_dir_all(&img_dir)?;
         let rel = format!("images/{digest}.png");
         let abs = self.store_dir.join(&rel);
-        if !abs.exists() {
-            let mut f = std::fs::File::create(&abs)?;
-            f.write_all(&png)?;
+        if abs.exists() {
+            let existing = std::fs::read(&abs)?;
+            anyhow::ensure!(
+                existing == png,
+                "image payload collision at {}",
+                abs.display()
+            );
+        } else {
+            let tmp = abs.with_extension("png.tmp");
+            {
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(&png)?;
+                f.sync_all()?;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &abs) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
         }
         match self.dedup {
             DedupMode::All => {
@@ -323,6 +338,30 @@ mod tests {
         assert_eq!(img_files, 1);
         let payload = s.payload_bytes(s.entries.first().unwrap()).unwrap();
         assert_eq!(payload, png);
+    }
+
+    #[test]
+    fn existing_image_payload_must_match_hash_target() {
+        let dir = tmpdir("img-collision");
+        let png: Vec<u8> = {
+            let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([11, 12, 13, 255]));
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let digest = content_hash(&png);
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(images.join(format!("{digest}.png")), b"corrupt").unwrap();
+
+        let clip = shared("");
+        let mut w = w(clip, &dir);
+        let mut s = Store::open(&dir).unwrap();
+        let err = w.record_image(&mut s, png).unwrap_err().to_string();
+        assert!(err.contains("image payload collision"), "{err}");
+        assert!(s.is_empty());
     }
 
     #[test]
