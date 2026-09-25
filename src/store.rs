@@ -11,6 +11,23 @@ use std::path::{Path, PathBuf};
 pub const HISTORY_FILE: &str = "history.jsonl";
 const LOCK_FILE: &str = "store.lock";
 
+#[derive(Debug)]
+struct LockContended {
+    dir: PathBuf,
+}
+
+impl std::fmt::Display for LockContended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another clipcrate process holds the store lock ({})",
+            self.dir.display()
+        )
+    }
+}
+
+impl std::error::Error for LockContended {}
+
 /// A handle to the on-disk history. All writers take an exclusive `flock`
 /// for the lifetime of the handle so watcher and CLI never interleave.
 #[derive(Debug)]
@@ -54,10 +71,10 @@ impl Store {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         continue;
                     }
-                    return Err(anyhow::anyhow!(
-                        "another clipcrate process holds the store lock ({})",
-                        dir.display()
-                    ));
+                    return Err(LockContended {
+                        dir: dir.to_path_buf(),
+                    }
+                    .into());
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -73,6 +90,10 @@ impl Store {
             entries,
             next_id,
         })
+    }
+
+    pub fn is_lock_contended(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<LockContended>().is_some()
     }
 
     /// Newest entry first.
