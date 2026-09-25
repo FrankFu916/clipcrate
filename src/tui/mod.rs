@@ -17,6 +17,18 @@ use ratatui::{
     Frame, Terminal,
 };
 
+fn sanitize_terminal_line(line: &str) -> String {
+    line.chars()
+        .map(|c| {
+            if c.is_control() && c != '\t' {
+                '�'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 pub struct Picker<'a> {
     store: &'a mut Store,
     query: String,
@@ -218,6 +230,7 @@ impl<'a> Picker<'a> {
                         .text
                         .lines()
                         .take(preview_lines)
+                        .map(sanitize_terminal_line)
                         .map(Line::from)
                         .chain(std::iter::once(Line::from("…".dim())))
                         .take(
@@ -241,6 +254,19 @@ impl<'a> Picker<'a> {
         f.render_widget(
             Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(preview_title)),
             outer[2],
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_terminal_line;
+
+    #[test]
+    fn terminal_preview_replaces_control_characters() {
+        assert_eq!(
+            sanitize_terminal_line("safe\u{1b}[31m\u{7}text\tcolumn"),
+            "safe�[31m�text\tcolumn"
         );
     }
 }
