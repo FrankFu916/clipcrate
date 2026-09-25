@@ -3,6 +3,7 @@
 
 use crate::backend::Clipboard;
 use crate::config::{Config, DedupMode};
+use crate::entry::Kind;
 use crate::filter::Filter;
 use crate::store::Store;
 use anyhow::Result;
@@ -25,6 +26,7 @@ pub struct Watcher<C: Clipboard> {
     poll: Duration,
     filter: Filter,
     dedup: DedupMode,
+    active_config: Config,
     poll_override_ms: Option<u64>,
 }
 
@@ -39,6 +41,7 @@ impl<C: Clipboard> Watcher<C> {
             poll,
             filter: Filter::new(cfg)?,
             dedup: cfg.dedup,
+            active_config: cfg.clone(),
             poll_override_ms: None,
         })
     }
@@ -53,7 +56,7 @@ impl<C: Clipboard> Watcher<C> {
 
     /// One poll cycle against an open store. Public so tests can step it.
     pub fn tick(&mut self, store: &mut Store) -> Result<Tick> {
-        self.reload_config()?;
+        let _ = self.reload_config()?;
 
         if let Some(png) = self.clip.get_image_png()? {
             return self.record_image(store, png);
@@ -63,22 +66,28 @@ impl<C: Clipboard> Watcher<C> {
         self.record_text(store, text)
     }
 
-    fn reload_config(&mut self) -> Result<()> {
+    fn reload_config(&mut self) -> Result<bool> {
         let path = self.store_dir.join("config.toml");
         match Config::load(&path) {
             Ok(cfg) => {
+                let capture_rules_changed = cfg.min_length != self.active_config.min_length
+                    || cfg.max_length != self.active_config.max_length
+                    || cfg.deny_patterns != self.active_config.deny_patterns
+                    || cfg.dedup != self.active_config.dedup;
                 self.filter = Filter::new(&cfg)?;
                 self.dedup = cfg.dedup;
                 let poll_ms = self.poll_override_ms.unwrap_or(cfg.poll_ms.max(50));
                 self.poll = Duration::from_millis(poll_ms);
+                self.active_config = cfg;
+                Ok(capture_rules_changed)
             }
             Err(e) => {
                 // Keep the last valid configuration rather than killing a long-running
                 // watcher because a config edit was momentarily incomplete.
                 eprintln!("clipcrate: ignoring invalid config reload: {e:#}");
+                Ok(false)
             }
         }
-        Ok(())
     }
 
     fn record_text(&mut self, store: &mut Store, text: String) -> Result<Tick> {
@@ -103,14 +112,43 @@ impl<C: Clipboard> Watcher<C> {
             let mut f = std::fs::File::create(&abs)?;
             f.write_all(&png)?;
         }
-        // Identical image re-copied: bump existing entry instead of duplicating.
-        if let Some(e) = store.entries.iter_mut().rev().find(|e| e.text == rel) {
-            e.ts = crate::entry::now_ms();
-            store.rewrite()?;
-            return Ok(Tick::Deduped);
+        match self.dedup {
+            DedupMode::All => {
+                store.push_image_entry(&rel, png.len() as u64)?;
+                Ok(Tick::Recorded)
+            }
+            DedupMode::Bump => {
+                if let Some(i) = store
+                    .entries
+                    .iter()
+                    .rposition(|e| e.kind == Kind::Image && e.text == rel)
+                {
+                    let mut e = store.entries.remove(i);
+                    e.ts = crate::entry::now_ms();
+                    store.entries.push(e);
+                    store.rewrite()?;
+                    Ok(Tick::Deduped)
+                } else {
+                    store.push_image_entry(&rel, png.len() as u64)?;
+                    Ok(Tick::Recorded)
+                }
+            }
+            DedupMode::Update => {
+                if let Some(e) = store
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find(|e| e.kind == Kind::Image && e.text == rel)
+                {
+                    e.ts = crate::entry::now_ms();
+                    store.rewrite()?;
+                    Ok(Tick::Deduped)
+                } else {
+                    store.push_image_entry(&rel, png.len() as u64)?;
+                    Ok(Tick::Recorded)
+                }
+            }
         }
-        store.push_image_entry(&rel, png.len() as u64)?;
-        Ok(Tick::Recorded)
     }
 
     /// Run until `stop` is set. Sleeps between polls; each tick opens the
@@ -122,7 +160,10 @@ impl<C: Clipboard> Watcher<C> {
                 return Ok(());
             }
 
-            self.reload_config()?;
+            if self.reload_config()? {
+                // A filter or dedup change can make the unchanged clipboard eligible again.
+                last_seen = None;
+            }
 
             let snapshot = match self.clip.get_image_png() {
                 Ok(Some(png)) => Some((format!("i:{}", content_hash(&png)), Some(png), None)),
@@ -283,6 +324,33 @@ mod tests {
     }
 
     #[test]
+    fn image_dedup_all_records_each_event_but_reuses_payload() {
+        let dir = tmpdir("img-all");
+        let png: Vec<u8> = {
+            let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([5, 6, 7, 255]));
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let fake = FakeClipboard {
+            png: Some(png),
+            ..Default::default()
+        };
+        let clip: Clip = std::sync::Arc::new(std::sync::Mutex::new(fake));
+        let mut w = w(clip, &dir);
+        w.dedup = DedupMode::All;
+        let mut s = Store::open(&dir).unwrap();
+
+        assert_eq!(w.tick(&mut s).unwrap(), Tick::Recorded);
+        w.dedup = DedupMode::All;
+        assert_eq!(w.record_image(&mut s, s.payload_bytes(&s.entries[0]).unwrap()).unwrap(), Tick::Recorded);
+        assert_eq!(s.len(), 2);
+        assert_eq!(std::fs::read_dir(dir.join("images")).unwrap().count(), 1);
+    }
+
+    #[test]
     fn run_loop_persists_across_reopens() {
         // Drive run()'s inner logic via repeated tick + reopen, which is what
         // run() does each cycle; actual thread timing is covered by e2e tests.
@@ -296,6 +364,30 @@ mod tests {
         }
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.iter_newest_first().next().unwrap().text, "persist me");
+    }
+
+    #[test]
+    fn reload_reports_capture_rule_changes_only() {
+        let dir = tmpdir("reload");
+        let clip = shared("same clipboard");
+        let base = Config {
+            poll_ms: 50,
+            ..Default::default()
+        };
+        base.save(&dir.join("config.toml")).unwrap();
+        let mut w = Watcher::new(clip, dir.clone(), &base).unwrap();
+
+        assert!(!w.reload_config().unwrap());
+
+        let mut changed = base.clone();
+        changed.preview_lines = 20;
+        changed.save(&dir.join("config.toml")).unwrap();
+        assert!(!w.reload_config().unwrap());
+
+        changed.deny_patterns.push("^blocked$".into());
+        changed.save(&dir.join("config.toml")).unwrap();
+        assert!(w.reload_config().unwrap());
+        assert!(!w.reload_config().unwrap());
     }
 
     #[test]
