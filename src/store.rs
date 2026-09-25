@@ -119,6 +119,10 @@ impl Store {
         &self.dir
     }
 
+    fn retention_limit(&self) -> Result<usize> {
+        Ok(crate::config::Config::load(&self.dir.join("config.toml"))?.max_entries)
+    }
+
     /// Record new content. Returns `None` when dedup suppressed the insert
     /// (the existing entry was bumped/kept instead).
     pub fn push_text(&mut self, text: &str, mode: DedupMode) -> Result<Option<u64>> {
@@ -157,6 +161,7 @@ impl Store {
     }
 
     fn append_text(&mut self, text: &str) -> Result<u64> {
+        let max_entries = self.retention_limit()?;
         let id = self.next_id;
         let next_id = id.checked_add(1).context("history id space exhausted")?;
         let entry = Entry::new_text(id, now_ms(), text.to_string());
@@ -169,12 +174,13 @@ impl Store {
         f.flush()?;
         self.entries.push(entry);
         self.next_id = next_id;
-        self.evict_and_rewrite()?;
+        self.evict_and_rewrite(max_entries)?;
         Ok(id)
     }
 
     /// Insert a pre-built image entry (PNG already written by the caller).
     pub fn push_image_entry(&mut self, rel_path: &str, size: u64) -> Result<u64> {
+        let max_entries = self.retention_limit()?;
         let id = self.next_id;
         let next_id = id.checked_add(1).context("history id space exhausted")?;
         let entry = Entry::new_image(id, now_ms(), rel_path, size);
@@ -187,19 +193,15 @@ impl Store {
         f.flush()?;
         self.entries.push(entry);
         self.next_id = next_id;
-        self.evict_and_rewrite()?;
+        self.evict_and_rewrite(max_entries)?;
         Ok(id)
     }
 
     /// Evict unpinned overflow (oldest first), drop image payloads that are
     /// no longer referenced, and rewrite the file atomically.
-    fn evict_and_rewrite(&mut self) -> Result<()> {
-        let max = crate::config::Config::load(&self.dir.join("config.toml"))
-            .ok()
-            .map(|c| c.max_entries)
-            .unwrap_or(1000);
+    fn evict_and_rewrite(&mut self, max_entries: usize) -> Result<()> {
         let unpinned_count = self.entries.iter().filter(|e| !e.pinned).count();
-        let overflow = unpinned_count.saturating_sub(max);
+        let overflow = unpinned_count.saturating_sub(max_entries);
         for _ in 0..overflow {
             let oldest = self
                 .entries
@@ -220,7 +222,8 @@ impl Store {
 
     /// Enforce retention limits after bulk mutations such as import.
     pub fn enforce_limits(&mut self) -> Result<()> {
-        self.evict_and_rewrite()
+        let max_entries = self.retention_limit()?;
+        self.evict_and_rewrite(max_entries)
     }
 
     /// Delete image files nothing references anymore.
@@ -527,6 +530,22 @@ mod tests {
 
         let e = Entry::new_text(99, now_ms(), "payload");
         assert_eq!(s.payload_bytes(&e).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn invalid_config_blocks_append_without_data_loss() {
+        let dir = tmpdir("invalid-config-write");
+        let mut s = Store::open(&dir).unwrap();
+        s.push_text("kept", DedupMode::All).unwrap();
+        let before = fs::read_to_string(dir.join(HISTORY_FILE)).unwrap();
+
+        fs::write(dir.join("config.toml"), "min_length = 10\nmax_length = 2\n").unwrap();
+        assert!(s.push_text("must-not-append", DedupMode::All).is_err());
+
+        let after = fs::read_to_string(dir.join(HISTORY_FILE)).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.entries[0].text, "kept");
     }
 
     #[test]
