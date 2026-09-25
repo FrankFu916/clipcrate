@@ -331,6 +331,16 @@ fn load_entries(path: &Path) -> Result<Vec<Entry>> {
         }
         let e: Entry = serde_json::from_str(&line)
             .with_context(|| format!("corrupt history line {} in {}", i + 1, path.display()))?;
+        if e.kind == Kind::Image {
+            let root = path.parent().unwrap_or_else(|| Path::new("."));
+            if e.payload_path(root).is_none() {
+                anyhow::bail!(
+                    "unsafe image path on history line {} in {}",
+                    i + 1,
+                    path.display()
+                );
+            }
+        }
         out.push(e);
     }
     Ok(out)
