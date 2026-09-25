@@ -335,7 +335,7 @@ mod tests {
             buf
         };
         let fake = FakeClipboard {
-            png: Some(png),
+            png: Some(png.clone()),
             ..Default::default()
         };
         let clip: Clip = std::sync::Arc::new(std::sync::Mutex::new(fake));
@@ -343,9 +343,8 @@ mod tests {
         w.dedup = DedupMode::All;
         let mut s = Store::open(&dir).unwrap();
 
-        assert_eq!(w.tick(&mut s).unwrap(), Tick::Recorded);
-        w.dedup = DedupMode::All;
-        assert_eq!(w.record_image(&mut s, s.payload_bytes(&s.entries[0]).unwrap()).unwrap(), Tick::Recorded);
+        assert_eq!(w.record_image(&mut s, png.clone()).unwrap(), Tick::Recorded);
+        assert_eq!(w.record_image(&mut s, png).unwrap(), Tick::Recorded);
         assert_eq!(s.len(), 2);
         assert_eq!(std::fs::read_dir(dir.join("images")).unwrap().count(), 1);
     }
