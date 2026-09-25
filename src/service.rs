@@ -30,10 +30,31 @@ fn exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("cannot resolve clipcrate binary path")
 }
 
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn systemd_quote(s: &str) -> Result<String> {
+    anyhow::ensure!(
+        !s.chars().any(char::is_control),
+        "service executable path contains control characters"
+    );
+    Ok(format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
 /// Render the service file content for the current platform (unit-testable).
 pub fn render_unit(platform: Platform, exe: &str, poll_ms: u64) -> Result<String> {
     match platform {
-        Platform::MacOS => Ok(format!(
+        Platform::MacOS => {
+            let exe = xml_escape(exe);
+            Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -56,21 +77,25 @@ pub fn render_unit(platform: Platform, exe: &str, poll_ms: u64) -> Result<String
 "#,
             exe = exe,
             poll_ms = poll_ms,
-        )),
-        Platform::Linux => Ok(format!(
+        ))
+        }
+        Platform::Linux => {
+            let exe = systemd_quote(exe)?;
+            Ok(format!(
             r#"[Unit]
 Description=clipcrate clipboard history watcher
 After=graphical-session.target
 
 [Service]
-ExecStart="{exe}" watch --poll-ms {poll_ms}
+ExecStart={exe} watch --poll-ms {poll_ms}
 Restart=on-failure
 RestartSec=3
 
 [Install]
 WantedBy=default.target
 "#
-        )),
+        ))
+        }
         Platform::Windows => bail!("Windows uses the HKCU Run registry value; nothing to render"),
     }
 }
@@ -93,6 +118,7 @@ fn dirs_home() -> Result<PathBuf> {
 
 /// Install + start the service. Returns a human-readable summary.
 pub fn install(poll_ms: u64) -> Result<String> {
+    let poll_ms = poll_ms.max(50);
     let platform = detect();
     let exe = exe_path()?.to_string_lossy().to_string();
     let path = unit_path(platform)?;
@@ -248,15 +274,16 @@ mod tests {
         assert!(xml.contains("<string>/usr/local/bin/clipcrate</string>"));
         assert!(xml.contains("<string>700</string>"));
         assert!(xml.contains("dev.clipcrate"));
-        // Quick well-formedness check with Python's XML parser when available.
-        if let Ok(out) = Command::new("python3")
-            .args(["-c", "import sys,xml.dom.minidom;xml.dom.minidom.parseString(sys.stdin.read());print('ok')"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-        {
-            drop(out);
-        }
+    }
+
+    #[test]
+    fn service_templates_escape_executable_paths() {
+        let xml = render_unit(Platform::MacOS, "/tmp/A&B<clip>/clipcrate", 700).unwrap();
+        assert!(xml.contains("/tmp/A&amp;B&lt;clip&gt;/clipcrate"));
+
+        let unit = render_unit(Platform::Linux, r#"/tmp/a b/"quoted"/clip\crate"#, 700).unwrap();
+        assert!(unit.contains(r#"ExecStart="/tmp/a b/\"quoted\"/clip\\crate" watch --poll-ms 700"#));
+        assert!(render_unit(Platform::Linux, "/tmp/bad\npath", 700).is_err());
     }
 
     #[test]
