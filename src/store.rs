@@ -281,8 +281,7 @@ impl Store {
                 true
             }
         });
-        let deleted = !removed_ids.is_empty();
-        deleted
+        !removed_ids.is_empty()
     }
 
     /// Remove all unpinned entries; returns how many were removed.
