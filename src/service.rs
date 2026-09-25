@@ -48,7 +48,7 @@ fn systemd_quote(s: &str) -> Result<String> {
         s.replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('%', "%%")
-            .replace('
+            .replace('$', "$$")
     ))
 }
 
