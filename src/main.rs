@@ -285,6 +285,9 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                     }
 
                     let export_root = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+                    if !export_root.as_os_str().is_empty() {
+                        std::fs::create_dir_all(export_root)?;
+                    }
                     // Validate and copy every referenced image before publishing
                     // the JSONL manifest, so a failed image export cannot leave
                     // behind an apparently complete backup manifest.
@@ -530,11 +533,23 @@ fn replace_export_file(src: &std::path::Path, dst: &std::path::Path) -> Result<(
     }
     #[cfg(windows)]
     {
+        let backup = dst.with_extension("export.bak");
+        let _ = std::fs::remove_file(&backup);
         if dst.exists() {
-            std::fs::remove_file(dst)?;
+            std::fs::rename(dst, &backup)?;
         }
-        std::fs::rename(src, dst)?;
-        Ok(())
+        match std::fs::rename(src, dst) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(backup);
+                Ok(())
+            }
+            Err(e) => {
+                if backup.exists() {
+                    let _ = std::fs::rename(&backup, dst);
+                }
+                Err(e.into())
+            }
+        }
     }
 }
 
