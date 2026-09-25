@@ -63,6 +63,7 @@ impl Store {
             )
         })?;
 
+        recover_interrupted_rewrite(&path)?;
         let entries = load_entries(&path)?;
         let next_id = entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
         Ok(Store {
@@ -177,7 +178,6 @@ impl Store {
                 None => break,
             }
         }
-        drop(self.prune_orphan_images());
         self.rewrite()
     }
 
@@ -186,7 +186,12 @@ impl Store {
         let img_dir = self.dir.join("images");
         let ok =
             |rd: std::io::Result<fs::DirEntry>| -> Option<PathBuf> { rd.ok().map(|e| e.path()) };
-        for p in fs::read_dir(&img_dir)?.filter_map(ok) {
+        let rd = match fs::read_dir(&img_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for p in rd.filter_map(ok) {
             let name = p.file_name().unwrap().to_string_lossy().to_string();
             if !name.ends_with(".png") {
                 continue;
@@ -216,7 +221,8 @@ impl Store {
             w.flush()?;
             w.get_ref().sync_all()?;
         }
-        fs::rename(&tmp, &self.path)?;
+        replace_file(&tmp, &self.path)?;
+        self.prune_orphan_images()?;
         Ok(())
     }
 
@@ -243,9 +249,6 @@ impl Store {
             }
         });
         let deleted = !removed_ids.is_empty();
-        if deleted {
-            drop(self.prune_orphan_images());
-        }
         deleted
     }
 
@@ -267,6 +270,49 @@ impl Store {
                 let mut buf = Vec::new();
                 File::open(p)?.read_to_end(&mut buf)?;
                 Ok(buf)
+            }
+        }
+    }
+}
+
+fn recover_interrupted_rewrite(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let backup = path.with_extension("jsonl.bak");
+    let tmp = path.with_extension("jsonl.tmp");
+    if backup.exists() {
+        fs::rename(&backup, path)?;
+    } else if tmp.exists() {
+        fs::rename(&tmp, path)?;
+    }
+    Ok(())
+}
+
+fn replace_file(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(src, dst)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        let backup = dst.with_extension("jsonl.bak");
+        let _ = fs::remove_file(&backup);
+        if dst.exists() {
+            fs::rename(dst, &backup)?;
+        }
+        match fs::rename(src, dst) {
+            Ok(()) => {
+                let _ = fs::remove_file(backup);
+                Ok(())
+            }
+            Err(e) => {
+                if backup.exists() {
+                    let _ = fs::rename(&backup, dst);
+                }
+                Err(e.into())
             }
         }
     }
@@ -398,6 +444,31 @@ mod tests {
         fs::write(dir.join(HISTORY_FILE), "{not json}\n").unwrap();
         let err = Store::open(&dir).unwrap_err().to_string();
         assert!(err.contains("corrupt history line"), "got: {err}");
+    }
+
+    #[test]
+    fn rewrite_prunes_orphan_images_after_commit() {
+        let dir = tmpdir("prune");
+        let images = dir.join("images");
+        fs::create_dir_all(&images).unwrap();
+        fs::write(images.join("orphan.png"), b"not really png").unwrap();
+
+        let s = Store::open(&dir).unwrap();
+        s.rewrite().unwrap();
+        assert!(!images.join("orphan.png").exists());
+    }
+
+    #[test]
+    fn recovers_backup_if_history_is_missing() {
+        let dir = tmpdir("recover");
+        let path = dir.join(HISTORY_FILE);
+        let backup = path.with_extension("jsonl.bak");
+        let e = Entry::new_text(7, now_ms(), "restored");
+        fs::write(&backup, format!("{}\n", serde_json::to_string(&e).unwrap())).unwrap();
+
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.get(7).unwrap().text, "restored");
+        assert!(path.exists());
     }
 
     #[test]
