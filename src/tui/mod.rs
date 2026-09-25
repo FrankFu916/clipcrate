@@ -116,7 +116,11 @@ impl<'a> Picker<'a> {
                         });
                         self.store.rewrite()?;
                     }
-                    KeyCode::Delete => {
+                    KeyCode::Delete
+                    | KeyCode::Char('d')
+                        if key.code == KeyCode::Delete
+                            || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         self.with_selected(|s, id| {
                             s.delete(id);
                         });
@@ -245,19 +249,29 @@ impl<'a> Picker<'a> {
 /// Public entry point: sets up the alternate screen and runs the picker.
 /// The terminal is restored even on error.
 pub fn run_picker(store: &mut Store) -> Result<Option<u64>> {
-    use ratatui::crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    use ratatui::crossterm::{
+        cursor::Show,
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
+
+    struct RestoreTerminal;
+    impl Drop for RestoreTerminal {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+            let mut stdout = std::io::stdout();
+            let _ = ratatui::crossterm::execute!(stdout, LeaveAlternateScreen, Show);
+        }
+    }
+
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    ratatui::crossterm::execute!(stdout, EnterAlternateScreen)?;
+    if let Err(e) = ratatui::crossterm::execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e.into());
+    }
+    let _guard = RestoreTerminal;
+
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend)?;
-
-    let res = Picker::new(store).run_inner(&mut term);
-
-    disable_raw_mode()?;
-    ratatui::crossterm::execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    term.show_cursor()?;
-    res
+    Picker::new(store).run_inner(&mut term)
 }
