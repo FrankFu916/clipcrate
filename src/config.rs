@@ -52,18 +52,40 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Config> {
         let raw = match std::fs::read_to_string(path) {
             Ok(s) => s,
-            Err(_) => return Ok(Config::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) => return Err(e.into()),
         };
         // Unknown keys are ignored so newer configs don't break older builds.
         let cfg: Config = toml::from_str(&raw)?;
+        cfg.validate()?;
         Ok(cfg)
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        self.validate()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, toml::to_string_pretty(self)?)?;
+        let tmp = path.with_extension("toml.tmp");
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(toml::to_string_pretty(self)?.as_bytes())?;
+            f.sync_all()?;
+        }
+        replace_file(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.max_entries > 0, "max_entries must be greater than 0");
+        anyhow::ensure!(self.poll_ms >= 50, "poll_ms must be at least 50");
+        anyhow::ensure!(
+            self.min_length <= self.max_length,
+            "min_length must not exceed max_length"
+        );
+        anyhow::ensure!(self.preview_lines > 0, "preview_lines must be greater than 0");
+        self.compile_denies()?;
         Ok(())
     }
 
@@ -121,6 +143,22 @@ mod tests {
     }
 
     #[test]
+    fn invalid_ranges_are_rejected() {
+        let bad = Config {
+            min_length: 10,
+            max_length: 2,
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
+
+        let bad = Config {
+            max_entries: 0,
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
     fn deny_patterns_compile_or_fail() {
         let bad = Config {
             deny_patterns: vec!["sk-[a-zA-Z0-9]{10,}".into(), "(bad".into()],
@@ -138,5 +176,34 @@ mod tests {
         let d = std::env::temp_dir().join(format!("clipcrate-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+}
+
+fn replace_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(src, dst)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        let backup = dst.with_extension("toml.bak");
+        let _ = std::fs::remove_file(&backup);
+        if dst.exists() {
+            std::fs::rename(dst, &backup)?;
+        }
+        match std::fs::rename(src, dst) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(backup);
+                Ok(())
+            }
+            Err(e) => {
+                if backup.exists() {
+                    let _ = std::fs::rename(&backup, dst);
+                }
+                Err(e.into())
+            }
+        }
     }
 }
