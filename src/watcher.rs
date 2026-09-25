@@ -55,6 +55,7 @@ impl<C: Clipboard> Watcher<C> {
     }
 
     /// One poll cycle against an open store. Public so tests can step it.
+    #[cfg(test)]
     pub fn tick(&mut self, store: &mut Store) -> Result<Tick> {
         let _ = self.reload_config()?;
 
