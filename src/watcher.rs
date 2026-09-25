@@ -185,11 +185,12 @@ impl<C: Clipboard> Watcher<C> {
 
             let mut store = match Store::open(&self.store_dir) {
                 Ok(s) => s,
-                Err(_) => {
+                Err(e) if Store::is_lock_contended(&e) => {
                     // Lock held by a CLI command right now: retry this same snapshot later.
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
+                Err(e) => return Err(e),
             };
 
             let result = if let Some(png) = image {
