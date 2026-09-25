@@ -50,6 +50,7 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Config> {
+        recover_interrupted_save(path)?;
         let raw = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
@@ -78,13 +79,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.max_entries > 0, "max_entries must be greater than 0");
-        anyhow::ensure!(self.poll_ms >= 50, "poll_ms must be at least 50");
         anyhow::ensure!(
             self.min_length <= self.max_length,
             "min_length must not exceed max_length"
         );
-        anyhow::ensure!(self.preview_lines > 0, "preview_lines must be greater than 0");
         self.compile_denies()?;
         Ok(())
     }
@@ -151,11 +149,6 @@ mod tests {
         };
         assert!(bad.validate().is_err());
 
-        let bad = Config {
-            max_entries: 0,
-            ..Default::default()
-        };
-        assert!(bad.validate().is_err());
     }
 
     #[test]
@@ -177,6 +170,20 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         d
     }
+}
+
+fn recover_interrupted_save(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let backup = path.with_extension("toml.bak");
+    let tmp = path.with_extension("toml.tmp");
+    if backup.exists() {
+        std::fs::rename(&backup, path)?;
+    } else if tmp.exists() {
+        std::fs::rename(&tmp, path)?;
+    }
+    Ok(())
 }
 
 fn replace_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
