@@ -159,15 +159,20 @@ impl<'a> Picker<'a> {
 
     fn render(&mut self, f: &mut Frame) {
         let now = crate::entry::now_ms();
-        let preview_lines =
+        let configured_preview_lines =
             crate::config::Config::load(&crate::config::Config::data_dir().join("config.toml"))
                 .map(|c| c.preview_lines)
                 .unwrap_or(8);
+        let preview_lines = configured_preview_lines
+            .min(f.area().height.saturating_sub(8) as usize);
+        let preview_height = u16::try_from(preview_lines)
+            .unwrap_or(0)
+            .saturating_add(2);
 
         let outer = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(preview_lines as u16 + 2),
+            Constraint::Length(preview_height),
         ])
         .split(f.area());
 
