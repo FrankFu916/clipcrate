@@ -171,7 +171,14 @@ impl Store {
         let unpinned_count = self.entries.iter().filter(|e| !e.pinned).count();
         let overflow = unpinned_count.saturating_sub(max);
         for _ in 0..overflow {
-            match self.entries.iter().position(|e| !e.pinned) {
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.pinned)
+                .min_by_key(|(_, e)| (e.ts, e.id))
+                .map(|(idx, _)| idx);
+            match oldest {
                 Some(idx) => {
                     self.entries.remove(idx);
                 }
@@ -431,6 +438,37 @@ mod tests {
             "oldest unpinned must be evicted: {texts:?}"
         );
         assert_eq!(s.len(), 4); // 3 cap + 1 pinned
+    }
+
+    #[test]
+    fn update_mode_refreshes_lru_age() {
+        let dir = tmpdir("update-lru");
+        crate::config::Config {
+            max_entries: 2,
+            ..Default::default()
+        }
+        .save(&dir.join("config.toml"))
+        .unwrap();
+
+        let mut s = Store::open(&dir).unwrap();
+        s.push_text("a", DedupMode::Update).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        s.push_text("b", DedupMode::Update).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        s.push_text("a", DedupMode::Update).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        s.push_text("c", DedupMode::Update).unwrap();
+
+        let texts: Vec<&str> = s.entries.iter().map(|e| e.text.as_str()).collect();
+        assert!(
+            texts.contains(&"a"),
+            "recently refreshed entry must survive: {texts:?}"
+        );
+        assert!(texts.contains(&"c"));
+        assert!(
+            !texts.contains(&"b"),
+            "least-recently-used entry must be evicted: {texts:?}"
+        );
     }
 
     #[test]
