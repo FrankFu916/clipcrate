@@ -284,8 +284,12 @@ mod tests {
         let xml = render_unit(Platform::MacOS, "/tmp/A&B<clip>/clipcrate", 700).unwrap();
         assert!(xml.contains("/tmp/A&amp;B&lt;clip&gt;/clipcrate"));
 
-        let unit =
-            render_unit(Platform::Linux, r#"/tmp/a b/"quoted"/clip\crate/$HOME/%n"#, 700).unwrap();
+        let unit = render_unit(
+            Platform::Linux,
+            r#"/tmp/a b/"quoted"/clip\crate/$HOME/%n"#,
+            700,
+        )
+        .unwrap();
         assert!(unit.contains(
             r#"ExecStart="/tmp/a b/\"quoted\"/clip\\crate/$HOME/%%n" watch --poll-ms 700"#
         ));
