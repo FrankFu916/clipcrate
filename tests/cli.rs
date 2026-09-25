@@ -184,7 +184,10 @@ fn lowering_max_entries_applies_immediately() {
         assert!(ctx.run(&["add", t]).status.success());
     }
 
-    assert!(ctx.run(&["config", "set", "max_entries", "1"]).status.success());
+    assert!(ctx
+        .run(&["config", "set", "max_entries", "1"])
+        .status
+        .success());
     let list = ctx.stdout(&["list"]);
     assert!(!list.contains("one"), "{list}");
     assert!(!list.contains("two"), "{list}");
