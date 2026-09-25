@@ -112,6 +112,49 @@ impl Config {
     }
 }
 
+fn recover_interrupted_save(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let backup = path.with_extension("toml.bak");
+    let tmp = path.with_extension("toml.tmp");
+    if backup.exists() {
+        std::fs::rename(&backup, path)?;
+    } else if tmp.exists() {
+        std::fs::rename(&tmp, path)?;
+    }
+    Ok(())
+}
+
+fn replace_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(src, dst)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        let backup = dst.with_extension("toml.bak");
+        let _ = std::fs::remove_file(&backup);
+        if dst.exists() {
+            std::fs::rename(dst, &backup)?;
+        }
+        match std::fs::rename(src, dst) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(backup);
+                Ok(())
+            }
+            Err(e) => {
+                if backup.exists() {
+                    let _ = std::fs::rename(&backup, dst);
+                }
+                Err(e.into())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,48 +211,5 @@ mod tests {
         let d = std::env::temp_dir().join(format!("clipcrate-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
-    }
-}
-
-fn recover_interrupted_save(path: &Path) -> anyhow::Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-    let backup = path.with_extension("toml.bak");
-    let tmp = path.with_extension("toml.tmp");
-    if backup.exists() {
-        std::fs::rename(&backup, path)?;
-    } else if tmp.exists() {
-        std::fs::rename(&tmp, path)?;
-    }
-    Ok(())
-}
-
-fn replace_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(src, dst)?;
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    {
-        let backup = dst.with_extension("toml.bak");
-        let _ = std::fs::remove_file(&backup);
-        if dst.exists() {
-            std::fs::rename(dst, &backup)?;
-        }
-        match std::fs::rename(src, dst) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(backup);
-                Ok(())
-            }
-            Err(e) => {
-                if backup.exists() {
-                    let _ = std::fs::rename(&backup, dst);
-                }
-                Err(e.into())
-            }
-        }
     }
 }
