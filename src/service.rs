@@ -55,7 +55,7 @@ pub fn render_unit(platform: Platform, exe: &str, poll_ms: u64) -> Result<String
         Platform::MacOS => {
             let exe = xml_escape(exe);
             Ok(format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
+                r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -75,14 +75,14 @@ pub fn render_unit(platform: Platform, exe: &str, poll_ms: u64) -> Result<String
 </dict>
 </plist>
 "#,
-            exe = exe,
-            poll_ms = poll_ms,
-        ))
+                exe = exe,
+                poll_ms = poll_ms,
+            ))
         }
         Platform::Linux => {
             let exe = systemd_quote(exe)?;
             Ok(format!(
-            r#"[Unit]
+                r#"[Unit]
 Description=clipcrate clipboard history watcher
 After=graphical-session.target
 
@@ -94,7 +94,7 @@ RestartSec=3
 [Install]
 WantedBy=default.target
 "#
-        ))
+            ))
         }
         Platform::Windows => bail!("Windows uses the HKCU Run registry value; nothing to render"),
     }
