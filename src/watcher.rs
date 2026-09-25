@@ -43,18 +43,34 @@ impl<C: Clipboard> Watcher<C> {
 
     /// One poll cycle against an open store. Public so tests can step it.
     pub fn tick(&mut self, store: &mut Store) -> Result<Tick> {
-        // Reload rules that may have changed on disk.
-        if let Ok(cfg) = Config::load(&self.store_dir.join("config.toml")) {
-            self.filter = Filter::new(&cfg)?;
-            self.dedup = cfg.dedup;
-            self.poll = Duration::from_millis(cfg.poll_ms.max(50));
-        }
+        self.reload_config()?;
 
         if let Some(png) = self.clip.get_image_png()? {
             return self.record_image(store, png);
         }
 
         let text = self.clip.get_text()?;
+        self.record_text(store, text)
+    }
+
+    fn reload_config(&mut self) -> Result<()> {
+        let path = self.store_dir.join("config.toml");
+        match Config::load(&path) {
+            Ok(cfg) => {
+                self.filter = Filter::new(&cfg)?;
+                self.dedup = cfg.dedup;
+                self.poll = Duration::from_millis(cfg.poll_ms.max(50));
+            }
+            Err(e) => {
+                // Keep the last valid configuration rather than killing a long-running
+                // watcher because a config edit was momentarily incomplete.
+                eprintln!("clipcrate: ignoring invalid config reload: {e:#}");
+            }
+        }
+        Ok(())
+    }
+
+    fn record_text(&mut self, store: &mut Store, text: String) -> Result<Tick> {
         if text.is_empty() || !self.filter.accepts(&text)? {
             return Ok(Tick::Ignored);
         }
@@ -67,7 +83,7 @@ impl<C: Clipboard> Watcher<C> {
 
     fn record_image(&mut self, store: &mut Store, png: Vec<u8>) -> Result<Tick> {
         use std::io::Write as _;
-        let digest = blake3_hex(&png);
+        let digest = content_hash(&png);
         let img_dir = self.store_dir.join("images");
         std::fs::create_dir_all(&img_dir)?;
         let rel = format!("images/{digest}.png");
@@ -89,26 +105,48 @@ impl<C: Clipboard> Watcher<C> {
     /// Run until `stop` is set. Sleeps between polls; each tick opens the
     /// store briefly so CLI commands can interleave between ticks.
     pub fn run(mut self, stop: Arc<AtomicBool>) -> Result<()> {
-        let mut last_text = String::new();
+        let mut last_seen: Option<String> = None;
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
+
+            self.reload_config()?;
+
+            let snapshot = match self.clip.get_image_png() {
+                Ok(Some(png)) => Some((format!("i:{}", content_hash(&png)), Some(png), None)),
+                Ok(None) => match self.clip.get_text() {
+                    Ok(text) => Some((format!("t:{text}"), None, Some(text))),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            };
+
+            let Some((fingerprint, image, text)) = snapshot else {
+                std::thread::sleep(self.poll);
+                continue;
+            };
+            if last_seen.as_deref() == Some(fingerprint.as_str()) {
+                std::thread::sleep(self.poll);
+                continue;
+            }
+
             let mut store = match Store::open(&self.store_dir) {
                 Ok(s) => s,
                 Err(_) => {
-                    // Lock held by a CLI command right now: skip this tick.
+                    // Lock held by a CLI command right now: retry this same snapshot later.
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
             };
-            let text = self.clip.get_text().unwrap_or_default();
-            if text != last_text && !text.is_empty() {
-                let before = store.len();
-                let _ = self.tick(&mut store);
-                if store.len() != before || self.dedup != DedupMode::All {
-                    last_text = text;
-                }
+
+            let result = if let Some(png) = image {
+                self.record_image(&mut store, png)
+            } else {
+                self.record_text(&mut store, text.unwrap_or_default())
+            };
+            if result.is_ok() {
+                last_seen = Some(fingerprint);
             }
             drop(store);
             std::thread::sleep(self.poll);
@@ -116,17 +154,16 @@ impl<C: Clipboard> Watcher<C> {
     }
 }
 
-/// FNV-1a hex digest — enough to dedupe image payloads locally without
-/// pulling in a crypto stack.
-fn blake3_hex(data: &[u8]) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
+/// 128-bit FNV-1a content fingerprint used for local image deduplication.
+fn content_hash(data: &[u8]) -> String {
+    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013b;
     for b in data {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+        h ^= *b as u128;
+        h = h.wrapping_mul(PRIME);
     }
-    // Fold in length to avoid trivial prefix collisions.
-    h ^= data.len() as u64;
-    format!("{h:016x}{:016x}", h.swap_bytes())
+    h ^= data.len() as u128;
+    format!("{h:032x}")
 }
 
 #[cfg(test)]
@@ -252,9 +289,10 @@ mod tests {
 
     #[test]
     fn identical_images_get_same_name() {
-        let a = blake3_hex(b"same bytes");
-        let b = blake3_hex(b"same bytes");
+        let a = content_hash(b"same bytes");
+        let b = content_hash(b"same bytes");
         assert_eq!(a, b);
-        assert_ne!(a, blake3_hex(b"other bytes"));
+        assert_ne!(a, content_hash(b"other bytes"));
+        assert_eq!(a.len(), 32);
     }
 }
