@@ -301,8 +301,15 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                         if let Some(parent) = dst.parent() {
                             std::fs::create_dir_all(parent)?;
                         }
-                        std::fs::copy(&src, &dst)
-                            .with_context(|| format!("exporting image {}", src.display()))?;
+                        let same_file = if dst.exists() {
+                            std::fs::canonicalize(&src).ok() == std::fs::canonicalize(&dst).ok()
+                        } else {
+                            false
+                        };
+                        if !same_file {
+                            std::fs::copy(&src, &dst)
+                                .with_context(|| format!("exporting image {}", src.display()))?;
+                        }
                     }
                     Ok(())
                 }
