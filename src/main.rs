@@ -413,12 +413,9 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             if let Some(p) = poll_ms {
                 cfg.poll_ms = p.max(50);
             }
-            let w = watcher::Watcher::new(
-                backend::SystemClipboard::new(),
-                Config::data_dir(),
-                &cfg,
-            )?
-            .with_poll_override(poll_ms);
+            let w =
+                watcher::Watcher::new(backend::SystemClipboard::new(), Config::data_dir(), &cfg)?
+                    .with_poll_override(poll_ms);
             eprintln!(
                 "clipcrate watching (poll={}ms, data={}) — Ctrl+C to stop",
                 cfg.poll_ms,
@@ -506,8 +503,8 @@ fn doctor() -> Result<()> {
     println!("  version  : {}", env!("CARGO_PKG_VERSION"));
 
     let mut cb = backend::SystemClipboard::new();
-    match cb.get_text() {
-        Ok(_) => println!("  clipboard: OK"),
+    match cb.probe() {
+        Ok(()) => println!("  clipboard: OK"),
         Err(e) => {
             problems += 1;
             println!("  clipboard: FAIL ({e})");
