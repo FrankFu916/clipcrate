@@ -287,16 +287,13 @@ fn dispatch(cmd: Cmd) -> Result<()> {
                         s.len(),
                         p.display()
                     );
-                    let export_root = p
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."));
+                    let export_root = p.parent().unwrap_or_else(|| std::path::Path::new("."));
                     for e in s.entries.iter().filter(|e| e.kind == Kind::Image) {
                         let src = e
                             .payload_path(s.data_dir())
                             .context("unsafe image path in history")?;
-                        let file_name = src
-                            .file_name()
-                            .context("image payload has no file name")?;
+                        let file_name =
+                            src.file_name().context("image payload has no file name")?;
                         let dst = export_root.join("images").join(file_name);
                         if let Some(parent) = dst.parent() {
                             std::fs::create_dir_all(parent)?;
