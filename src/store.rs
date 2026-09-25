@@ -181,6 +181,11 @@ impl Store {
         self.rewrite()
     }
 
+    /// Enforce retention limits after bulk mutations such as import.
+    pub fn enforce_limits(&mut self) -> Result<()> {
+        self.evict_and_rewrite()
+    }
+
     /// Delete image files nothing references anymore.
     fn prune_orphan_images(&self) -> Result<()> {
         let img_dir = self.dir.join("images");
